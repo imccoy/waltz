@@ -1,0 +1,17 @@
+Name: Waltz
+Version: 0.0
+Cabal-Version: >= 1.2
+License: BSD3
+Author: Iain McCoy
+Synopsis: The deranged blatherings of a madman
+Build-Type: Simple
+
+Executable Incrementaliser
+  Hs-Source-Dirs: src
+  Main-Is: Main.hs
+  Extensions: DeriveDataTypeable,
+              ExistentialQuantification,
+              MultiParamTypeClasses,
+              OverloadedStrings
+  build-depends: base, containers, text
+  ghc-options: -Werror -fwarn-unused-imports
