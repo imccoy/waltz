@@ -27,15 +27,25 @@ eventWord (NewDefinition w _) = w
 eventDefinition (NewDefinition _ d) = d
 eventDefinition _ = error "no definition"
 
-data AppState = AppState (W.List Text) (W.ListDict Text Text)
+appState :: W.List Event -> W.Struct
+appState evts = W.Struct [
+                 ("words", W.WatchableThing $
+                           ((W.mapList eventWord) . 
+                            (W.filterList isNewWord))
+                            evts),
+                 ("defns", W.WatchableThing $
+                           ((W.mapListDict eventDefinition) .
+                            (W.shuffle eventWord) .
+                            (W.filterList isNewDefinition))
+                            evts)]
 
-appState :: W.List Event -> AppState
-appState evts = AppState (((W.mapList eventWord) . 
-                           (W.filterList isNewWord))
-                          evts)
-                         (((W.mapListDict eventDefinition) .
-                           (W.shuffle eventWord) .
-                           (W.filterList isNewDefinition))
-                          evts)
-
-main = return ()
+main = do let changes = [NewWord "Dog"
+                        ,NewDefinition "Dog" "Man's best friend"]
+          let initialState = W.initialValue $ appState W.InputList
+          let (W.Struct structElems) = appState W.InputList
+          let finalState = foldl W.applyChange initialState $
+                             concatMap (\c -> map (\(n, _) -> W.StructElementChange n [
+                                               W.ListChange $ W.AddElement $ toData c])
+                                            structElems
+                                 ) changes
+          print $ show finalState

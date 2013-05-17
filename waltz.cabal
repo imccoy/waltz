@@ -13,5 +13,5 @@ Executable Incrementaliser
               ExistentialQuantification,
               MultiParamTypeClasses,
               OverloadedStrings
-  build-depends: base, containers, text
+  build-depends: base, containers, text, safe
   ghc-options: -Werror -fwarn-unused-imports
