@@ -14,6 +14,7 @@ instance Datable Event where
                               in NewWord (fromData w)
     | e == "NewDefinition" = let [w,d] = args
                               in NewDefinition (fromData w) (fromData d)
+  fromData e = error $ "Can't fromData event " ++ show e
 
 isNewWord (NewWord _) = True
 isNewWord _ = False
@@ -28,24 +29,24 @@ eventDefinition (NewDefinition _ d) = d
 eventDefinition _ = error "no definition"
 
 appState :: W.List Event -> W.Struct
-appState evts = W.Struct [
+appState evts = W.struct [
                  ("words", W.WatchableThing $
                            ((W.mapList eventWord) . 
                             (W.filterList isNewWord))
-                            evts),
+                            evts) ,
                  ("defns", W.WatchableThing $
                            ((W.mapListDict eventDefinition) .
                             (W.shuffle eventWord) .
                             (W.filterList isNewDefinition))
-                            evts)]
+                            evts)
+                 ]
 
 main = do let changes = [NewWord "Dog"
                         ,NewDefinition "Dog" "Man's best friend"]
-          let initialState = W.initialValue $ appState W.InputList
-          let (W.Struct structElems) = appState W.InputList
-          let finalState = foldl W.applyChange initialState $
-                             concatMap (\c -> map (\(n, _) -> W.StructElementChange n [
-                                               W.ListChange $ W.AddElement $ toData c])
-                                            structElems
-                                 ) changes
+          let inputList = W.inputList :: (W.List Event)
+          let state = appState inputList
+          let initialState = W.initialValue $ state
+          let compiled = W.fullCompile $ state
+          let finalState = foldl (W.applyChange compiled inputList) initialState changes
+          print $ "State@" ++ (show $ W.getWatchableId state) ++ ", input@" ++ (show $ W.getWatchableId inputList)
           print $ show finalState

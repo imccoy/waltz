@@ -6,12 +6,11 @@ Author: Iain McCoy
 Synopsis: The deranged blatherings of a madman
 Build-Type: Simple
 
-Executable Incrementaliser
+Executable waltz
   Hs-Source-Dirs: src
   Main-Is: Main.hs
-  Extensions: DeriveDataTypeable,
-              ExistentialQuantification,
+  Extensions: ExistentialQuantification,
               MultiParamTypeClasses,
               OverloadedStrings
   build-depends: base, containers, text, safe
-  ghc-options: -Werror -fwarn-unused-imports
+  ghc-options: -Werror -fwarn-unused-imports -fno-cse -fno-full-laziness

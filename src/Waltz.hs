@@ -1,34 +1,37 @@
 module Waltz where
 
-import Safe
-import Data.Text (Text)
+import Data.IORef
 import qualified Data.List as List
-import qualified Data.Set as Set
 import qualified Data.Map as Map
+import qualified Data.Set as Set
+import Data.Text (Text)
+import Debug.Trace
+import Safe
+import System.IO.Unsafe
 
--- What's all this, then?
---
--- We've got a bunch of WatchableThings: Set, List, Dict
--- We have Change, representing changes of values held in those types
--- and we have Data, which represent the values that are changing
---
--- When you construct the watchable things, you get instructions for how to make
--- whichever set, list or dict you wanted. Whenever
+{-# NOINLINE idRef #-} 
+idRef :: IORef Int
+idRef = unsafePerformIO $ newIORef 0
+
+{-# NOINLINE withRef #-} 
+withRef :: (Int -> b) -> b
+withRef f = f $ unsafePerformIO $ do
+  id <- readIORef idRef
+  writeIORef idRef (id + 1)
+  return id
+
 
 data Change = ListChange ListChange
-            | SetChange ListChange
-            | ChangeInKey Data Change
-            | StructElementChange Text [Change]
   deriving (Show)
 
 data ListChange = AddElement Data
                 | RemoveElement Data
-                | ChangeElement Data Data
   deriving (Show)
 
 data Data = ListData [Data]
           | SetData (Set.Set Data)
           | MapData (Map.Map Data Data)
+          | StructData (Map.Map Text Data)
           | IntegerData Integer
           | StringData Text
   deriving (Eq, Ord, Show)
@@ -53,116 +56,146 @@ instance Datable Text where
   toData s = StringData s
   fromData (StringData s) = s
 
-
-class Watchable a where
-  makeWatchers :: a -> [Watcher]
-  initialValue :: a -> Data
-
-newtype Watcher = Watcher (Change -> [Change])
-
-data Struct = Struct [(Text, WatchableThing)]
-
 data WatchableThing = forall a. (Watchable a) => WatchableThing a
 
-instance Watchable Struct where
-  makeWatchers (Struct s) = map mkChange s
-    where mkChange (k, (WatchableThing v))
-            = Watcher (\c ->
-                [StructElementChange k $ concatMap (\(Watcher w) -> w c) (makeWatchers v)]
-              )
-  initialValue (Struct s) = MapData $ foldr add Map.empty s
-    where add (k, (WatchableThing v)) m = Map.insert (toData k) (initialValue v) m
+data PathElement = StructPath Text | MapPath Data
+  deriving Show
 
-data List a = forall b. Datable b => MapList (b -> a) (List b) 
-            | FilterList (a -> Bool) (List a) 
-            | InputList
+data DepGraphAction = DepGraphChange Int (Change -> [Change])
+                    | DepGraphStructWalk Text
+                    | DepGraphMapWalk Int (Change -> Data)
+type DepGraph = [(Int, DepGraphAction)]
+
+fullCompile :: Watchable a => a -> Map.Map Int [DepGraphAction]
+fullCompile w = foldr add Map.empty $ compile w 
+  where add (n, action) m = Map.alter (set action) n m
+        set a Nothing = Just [a]
+        set a (Just as) = Just $ a:as
+
+class Watchable a where
+  initialValue :: a -> Data
+  compile :: a -> DepGraph
+  getWatchableId :: a -> Int
+
+data Struct = Struct Int [(Text, WatchableThing)]
+
+instance Watchable Struct where
+  initialValue (Struct _ elems) = StructData $ foldr addElem Map.empty elems
+    where addElem (key, WatchableThing v) map = Map.insert key (initialValue v) map
+  getWatchableId (Struct id _) = id
+  compile (Struct _ structElems) = concatMap compileElem structElems
+    where compileElem (name, WatchableThing v) = (getWatchableId v, DepGraphStructWalk name):
+                                                  (compile v)
+
+data List a = forall b. Datable b => MapList Int (b -> a) (List b) 
+            | FilterList Int (a -> Bool) (List a) 
+            | InputList Int
 
 instance (Datable a) => Watchable (List a) where
-  makeWatchers (MapList f l) = (Watcher go):(makeWatchers l)
-    where go (ListChange (AddElement elem))
-             = [ListChange $ AddElement $ toData (f $ fromData elem)]
-          go (ListChange (RemoveElement elem))
-             = [ListChange $ RemoveElement $ toData (f $ fromData elem)]
-          go (ListChange (ChangeElement elem1 elem2))
-             = [ListChange $ ChangeElement (toData (f $ fromData elem1))
-                                           (toData (f $ fromData elem2))]
-  makeWatchers (FilterList f l) = (Watcher go):(makeWatchers l)
-    where go (ListChange (AddElement elem))
-            | f $ fromData elem = [ListChange $ AddElement elem]
-            | otherwise         = []
-          go (ListChange (RemoveElement elem))
-            | f $ fromData elem = [ListChange $ RemoveElement elem]
-            | otherwise         = []
-          go (ListChange (ChangeElement _ _))
-            = error "so, this sucks"
-  makeWatchers InputList = []
-
   initialValue _ = ListData []
+  getWatchableId (MapList n _ _) = n
+  getWatchableId (FilterList n _ _) = n
+  getWatchableId (InputList n) = n
 
-data Set a = forall b. MapSet (b -> a) (Set b)
-           | FilterSet (a -> Bool) (Set a)
+  compile (MapList id f inner) = (getWatchableId inner, DepGraphChange id (mapf f)):(compile inner)
+    where mapf f (ListChange (AddElement elem)) = [ListChange (AddElement (toData $ f $ fromData elem))]
+          mapf f (ListChange (RemoveElement elem)) = [ListChange (RemoveElement (toData $ f $ fromData elem))]
+  compile (FilterList id f inner) = (getWatchableId inner, DepGraphChange id (filterf f)):(compile inner)
+    where filterf f (ListChange (AddElement elem))
+            | f $ fromData elem = [ListChange (AddElement elem)]
+            | otherwise = []
+          filterf f (ListChange (RemoveElement elem))
+            | f $ fromData elem = [ListChange (RemoveElement elem)]
+            | otherwise = []
+  compile (InputList n) = []
 
-data (Datable k, Datable v) =>
-     ListDict k v = ShuffleList (v -> k) (List v)
-                  | forall v0. Datable v0 => MapListDict (v0 -> v) (ListDict k v0)
+data ListDict k v = ShuffleList Int (v -> k) (List v)
+                  | forall v0. Datable v0 => MapListDict Int (v0 -> v) (ListDict k v0)
 
 instance (Datable k, Datable v) => Watchable (ListDict k v) where
-  makeWatchers (ShuffleList f l) = (Watcher go):(makeWatchers l)
-    where go change@(ListChange (AddElement elem))
-            = [ChangeInKey (toData $ f $ fromData elem) change]
-  makeWatchers (MapListDict f d) = [Watcher go]
-    where go (ChangeInKey k change)
-            = concatMap (\(Watcher w) -> map (ChangeInKey k) (w change)) ws
-          ws = makeWatchers d
-
-
   initialValue _ = MapData Map.empty
+  getWatchableId (ShuffleList n _ _) = n
+  getWatchableId (MapListDict n _ _) = n
+  compile (ShuffleList id f inner) = (getWatchableId inner, DepGraphMapWalk id (shufflef f)):(compile inner)
+    where shufflef f (ListChange (AddElement elem)) = toData $ f $ fromData elem
+          shufflef f (ListChange (RemoveElement elem)) = toData $ f $ fromData elem
 
-data SetDict k v = forall a. ShuffleSet (a -> k) (Set a)
+  compile (MapListDict id f inner) = (getWatchableId inner, DepGraphChange id (mapf f)):(compile inner)
+    where mapf f (ListChange (AddElement elem)) = [ListChange (AddElement (toData $ f $ fromData elem))]
+          mapf f (ListChange (RemoveElement elem)) = [ListChange (RemoveElement (toData $ f $ fromData elem))]
+
+applyChange :: Datable a => Map.Map Int [DepGraphAction] -> List a -> Data -> a -> Data
+applyChange dg input state change
+   = walkChanges dg
+                 (getWatchableId input)
+                 []
+                 state
+                 (ListChange $ AddElement $ toData change)
+
+walkChanges :: Map.Map Int [DepGraphAction] -> Int -> [PathElement] -> Data -> Change -> Data
+walkChanges dg input path state change = foldr perform state actions
+  where actions = fromJustDef [] $ Map.lookup input dg
+        perform (DepGraphChange id f) state
+          = trace ((show change) ++ " yields " ++ (show $ f change)) $
+            foldl (walkChanges dg id path) state (f change) 
+        perform (DepGraphStructWalk text) state
+          = applyChangeAt (path ++ [StructPath text]) change state
+        perform (DepGraphMapWalk n f) state
+          = applyChangeAt (path ++ [MapPath $ f change]) change state
+
+applyChangeAt :: [PathElement] -> Change -> Data -> Data
+applyChangeAt ((StructPath t):path) change (StructData state)
+  = StructData $ Map.adjust (applyChangeAt path change) t state
+applyChangeAt ((MapPath d):path) change (MapData state)
+  = MapData $ Map.adjust (applyChangeAt path change) d state
+applyChangeAt [] (ListChange (AddElement elem)) (ListData elems)
+  = ListData (elem:elems)
+applyChangeAt [] (ListChange (RemoveElement elem)) (ListData elems)
+  = ListData (List.delete elem elems)
+applyChangeAt path change d
+  = error $ "applyChangeAt got path " ++ show path ++ ", change " ++ show change ++ ", and data " ++ show d
+
+{-
+data Set a = forall b. MapSet Int (b -> a) (Set b)
+           | FilterSet Int (a -> Bool) (Set a)
+
+instance Watchable (Set a) where
+  initialValue _ = SetData Set.empty
+  getWatchableId (MapSet n _ _) = n
+  getWatchableId (FilterSet n _ _) = n
+
+mapSet f s = MapSet mkRef f s
+filterSet f l = FilterSet mkRef f l
+data SetDict k v = forall a. ShuffleSet Int (a -> k) (Set a)
+-}
 
 
-applyChange :: Data -> Change ->  Data
-applyChange (ListData l) (ListChange (AddElement e)) = ListData $ e:l
-applyChange (ListData l) (ListChange (RemoveElement e)) = ListData $ List.delete e l
-applyChange (ListData l) (ListChange (ChangeElement old new))
-   = ListData $ new:(List.delete old l)
 
-applyChange (SetData l) (SetChange (AddElement e)) = SetData $ Set.insert e l
-applyChange (SetData l) (SetChange (RemoveElement e)) = SetData $ Set.delete e l
-applyChange (SetData l) (SetChange (ChangeElement old new))
-   = SetData $ Set.insert new (Set.delete old l)
-
-applyChange (MapData map) (ChangeInKey k c)
-   = let valueAtKey = fromJustNote "no value at key" $ Map.lookup k map
-         newValue = applyChange valueAtKey c
-      in MapData $ Map.insert k newValue map
-
-applyChange (MapData map) (StructElementChange n changes)
-  = let value = fromJustNote ("no value at struct member " ++ show n) $ 
-                  Map.lookup (toData n) map
-        newValue = foldr (flip applyChange) value (reverse changes)
-     in MapData $ Map.insert (toData n) newValue map
-
-applyChange d c = error $ "No joy in change " ++ show c ++ " to " ++ show d
 
 {-
 class Mappable m a b where
   map :: (a -> b) -> m a -> m b
 
-class Filterable f a b where
+  class Filterable f a b where
   filter :: (a -> b) -> f a -> f b
 -}
 
-mapList f l = MapList f l
-filterList f l = FilterList f l
+mapList :: forall a b. (Datable a, Datable b)
+        => (a -> b) -> List a -> List b
+mapList f l = (withRef MapList) f l
+filterList f l = (withRef FilterList) f l
 
-mapSet f s = MapSet f s
-filterSet f l = FilterSet f l
 
 shuffle :: forall a k. (Datable a, Datable k)
         => (a -> k) -> List a -> ListDict k a
-shuffle f list = ShuffleList f list
+shuffle f list = (withRef ShuffleList) f list
 
 mapListDict :: forall k a b. (Datable k, Datable a, Datable b)
             => (a -> b) -> ListDict k a -> ListDict k b
-mapListDict f d = MapListDict f d
+mapListDict f d = (withRef MapListDict) f d
+
+inputList :: List a
+inputList = withRef InputList
+
+struct :: [(Text, WatchableThing)] -> Struct
+struct elems = (withRef Struct) elems
