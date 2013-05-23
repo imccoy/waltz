@@ -34,7 +34,7 @@ appState evts = W.struct [
                            ((W.mapList eventWord) . 
                             (W.filterList isNewWord))
                             evts) ,
-                 ("defns", W.WatchableThing $
+                 ("defns", W.ContainerThing $
                            ((W.mapListDict eventDefinition) .
                             (W.shuffle eventWord) .
                             (W.filterList isNewDefinition))
@@ -47,6 +47,5 @@ main = do let changes = [NewWord "Dog"
           let state = appState inputList
           let initialState = W.initialValue $ state
           let compiled = W.fullCompile $ state
-          let finalState = foldl (W.applyChange compiled inputList) initialState changes
-          print $ "State@" ++ (show $ W.getWatchableId state) ++ ", input@" ++ (show $ W.getWatchableId inputList)
+          let finalState = foldl (W.applyChange compiled state inputList) initialState changes
           print $ show finalState

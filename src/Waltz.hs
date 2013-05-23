@@ -5,7 +5,6 @@ import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Debug.Trace
 import Safe
 import System.IO.Unsafe
 
@@ -57,6 +56,7 @@ instance Datable Text where
   fromData (StringData s) = s
 
 data WatchableThing = forall a. (Watchable a) => WatchableThing a
+                    | forall a. (ContainerWatchable a, Watchable a) => ContainerThing a
 
 data PathElement = StructPath Text | MapPath Data
   deriving Show
@@ -77,15 +77,35 @@ class Watchable a where
   compile :: a -> DepGraph
   getWatchableId :: a -> Int
 
+class (Watchable a) => ContainerWatchable a where
+  initialValueAtPath :: [PathElement] -> a -> Data
+
 data Struct = Struct Int [(Text, WatchableThing)]
+
+structLookup text (Struct _ elems) = fromJustNote ("no struct element " ++ show text) $
+                                     lookup text elems
 
 instance Watchable Struct where
   initialValue (Struct _ elems) = StructData $ foldr addElem Map.empty elems
     where addElem (key, WatchableThing v) map = Map.insert key (initialValue v) map
+          addElem (key, ContainerThing v) map = Map.insert key (initialValue v) map
   getWatchableId (Struct id _) = id
   compile (Struct _ structElems) = concatMap compileElem structElems
     where compileElem (name, WatchableThing v) = (getWatchableId v, DepGraphStructWalk name):
                                                   (compile v)
+          compileElem (name, ContainerThing v) = (getWatchableId v, DepGraphStructWalk name):
+                                                  (compile v)
+instance ContainerWatchable Struct where
+  initialValueAtPath ((StructPath t):[]) struct
+    = case structLookup t struct of
+        (ContainerThing c) -> initialValue c
+        (WatchableThing t) -> initialValue t
+  initialValueAtPath ((StructPath t):path) struct
+    = case structLookup t struct of
+        (ContainerThing c) -> initialValueAtPath path c
+        eek -> error $ "can't get initialValueAtPath " ++ show path
+  initialValueAtPath [] struct
+    = initialValue struct
 
 data List a = forall b. Datable b => MapList Int (b -> a) (List b) 
             | FilterList Int (a -> Bool) (List a) 
@@ -124,35 +144,41 @@ instance (Datable k, Datable v) => Watchable (ListDict k v) where
     where mapf f (ListChange (AddElement elem)) = [ListChange (AddElement (toData $ f $ fromData elem))]
           mapf f (ListChange (RemoveElement elem)) = [ListChange (RemoveElement (toData $ f $ fromData elem))]
 
-applyChange :: Datable a => Map.Map Int [DepGraphAction] -> List a -> Data -> a -> Data
-applyChange dg input state change
+instance (Datable k, Datable v) => ContainerWatchable (ListDict k v) where
+  initialValueAtPath ((MapPath d):[]) (ShuffleList _ _ _) = ListData []
+  initialValueAtPath ((MapPath d):[]) (MapListDict _ _ _) = ListData []
+
+applyChange :: Datable a => Map.Map Int [DepGraphAction] -> Struct -> List a -> Data -> a -> Data
+applyChange dg struct input state change
    = walkChanges dg
+                 struct
                  (getWatchableId input)
                  []
                  state
                  (ListChange $ AddElement $ toData change)
 
-walkChanges :: Map.Map Int [DepGraphAction] -> Int -> [PathElement] -> Data -> Change -> Data
-walkChanges dg input path state change = foldr perform state actions
+walkChanges :: Map.Map Int [DepGraphAction] -> Struct -> Int -> [PathElement] -> Data -> Change -> Data
+walkChanges dg struct input path state change = foldr perform state actions
   where actions = fromJustDef [] $ Map.lookup input dg
         perform (DepGraphChange id f) state
-          = trace ((show change) ++ " yields " ++ (show $ f change)) $
-            foldl (walkChanges dg id path) state (f change) 
+          = foldl (walkChanges dg struct id path) state (f change) 
         perform (DepGraphStructWalk text) state
-          = applyChangeAt (path ++ [StructPath text]) change state
-        perform (DepGraphMapWalk n f) state
-          = applyChangeAt (path ++ [MapPath $ f change]) change state
+          = applyChangeAt struct ((StructPath text):path) ((StructPath text):path) change state
+        perform (DepGraphMapWalk id f) state
+          = walkChanges dg struct id ((MapPath $ f change):path) state change
 
-applyChangeAt :: [PathElement] -> Change -> Data -> Data
-applyChangeAt ((StructPath t):path) change (StructData state)
-  = StructData $ Map.adjust (applyChangeAt path change) t state
-applyChangeAt ((MapPath d):path) change (MapData state)
-  = MapData $ Map.adjust (applyChangeAt path change) d state
-applyChangeAt [] (ListChange (AddElement elem)) (ListData elems)
+applyChangeAt :: Struct -> [PathElement] -> [PathElement] -> Change -> Data -> Data
+applyChangeAt struct p0 ((StructPath t):path) change (StructData state)
+  = StructData $ Map.adjust (applyChangeAt struct p0 path change) t state
+applyChangeAt struct p0 ((MapPath d):path) change (MapData state)
+  = MapData $ Map.alter set d state
+  where set (Just v) = Just $ applyChangeAt struct p0 path change v
+        set Nothing  = Just $ applyChangeAt struct p0 path change (initialValueAtPath p0 struct)
+applyChangeAt struct p0 [] (ListChange (AddElement elem)) (ListData elems)
   = ListData (elem:elems)
-applyChangeAt [] (ListChange (RemoveElement elem)) (ListData elems)
+applyChangeAt struct p0 [] (ListChange (RemoveElement elem)) (ListData elems)
   = ListData (List.delete elem elems)
-applyChangeAt path change d
+applyChangeAt struct p0 path change d
   = error $ "applyChangeAt got path " ++ show path ++ ", change " ++ show change ++ ", and data " ++ show d
 
 {-
