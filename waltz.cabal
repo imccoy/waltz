@@ -11,6 +11,7 @@ Executable waltz
   Main-Is: Main.hs
   Extensions: ExistentialQuantification,
               MultiParamTypeClasses,
-              OverloadedStrings
+              OverloadedStrings,
+              GADTs
   build-depends: base, containers, text, safe
   ghc-options: -Werror -fwarn-unused-imports -fno-cse -fno-full-laziness

@@ -35,7 +35,7 @@ appState evts = W.struct [
                             (W.filterList isNewWord))
                             evts) ,
                  ("defns", W.ContainerThing $
-                           ((W.mapListDict eventDefinition) .
+                           ((W.mapDict $ W.mapList eventDefinition) .
                             (W.shuffle eventWord) .
                             (W.filterList isNewDefinition))
                             evts)

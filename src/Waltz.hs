@@ -61,6 +61,8 @@ data WatchableThing = forall a. (Watchable a) => WatchableThing a
 data PathElement = StructPath Text | MapPath Data
   deriving Show
 
+-- the Int in the action is the thing that receives the change. The Int in the
+-- DepGraph tuple is the thing that causes it.
 data DepGraphAction = DepGraphChange Int (Change -> [Change])
                     | DepGraphStructWalk Text
                     | DepGraphMapWalk Int (Change -> Data)
@@ -76,6 +78,7 @@ class Watchable a where
   initialValue :: a -> Data
   compile :: a -> DepGraph
   getWatchableId :: a -> Int
+  mkTube :: a -> a
 
 class (Watchable a) => ContainerWatchable a where
   initialValueAtPath :: [PathElement] -> a -> Data
@@ -95,6 +98,8 @@ instance Watchable Struct where
                                                   (compile v)
           compileElem (name, ContainerThing v) = (getWatchableId v, DepGraphStructWalk name):
                                                   (compile v)
+  mkTube _ = error "can't mkTube struct"
+
 instance ContainerWatchable Struct where
   initialValueAtPath ((StructPath t):[]) struct
     = case structLookup t struct of
@@ -129,24 +134,34 @@ instance (Datable a) => Watchable (List a) where
             | otherwise = []
   compile (InputList n) = []
 
-data ListDict k v = ShuffleList Int (v -> k) (List v)
-                  | forall v0. Datable v0 => MapListDict Int (v0 -> v) (ListDict k v0)
+  mkTube _ = withRef InputList
 
-instance (Datable k, Datable v) => Watchable (ListDict k v) where
+data Dict k v = forall elem. (List elem ~ v, Datable elem, Watchable v) 
+                => ShuffleList Int (elem -> k) v
+              | forall v0. Watchable v0 => MapDict Int (v0 -> v) (Dict k v0)
+
+instance (Datable k, Watchable v) => Watchable (Dict k v) where
   initialValue _ = MapData Map.empty
   getWatchableId (ShuffleList n _ _) = n
-  getWatchableId (MapListDict n _ _) = n
+  getWatchableId (MapDict n _ _) = n
   compile (ShuffleList id f inner) = (getWatchableId inner, DepGraphMapWalk id (shufflef f)):(compile inner)
     where shufflef f (ListChange (AddElement elem)) = toData $ f $ fromData elem
           shufflef f (ListChange (RemoveElement elem)) = toData $ f $ fromData elem
 
-  compile (MapListDict id f inner) = (getWatchableId inner, DepGraphChange id (mapf f)):(compile inner)
-    where mapf f (ListChange (AddElement elem)) = [ListChange (AddElement (toData $ f $ fromData elem))]
-          mapf f (ListChange (RemoveElement elem)) = [ListChange (RemoveElement (toData $ f $ fromData elem))]
+  compile mapDict@(MapDict id f inner) = (getWatchableId inner, DepGraphChange funnelIn (\x -> [x])):
+                                         (funnelOut, DepGraphChange id (\x -> [x])):
+                                         (funnelCompiled ++ compile inner)
+    where (funnelIn, funnelOut, funnelCompiled) = mkFunnel f
+  mkTube _ = error "can't mkTube dict"
 
-instance (Datable k, Datable v) => ContainerWatchable (ListDict k v) where
+mkFunnel :: forall a b. (Watchable a, Watchable b) => (a -> b) -> (Int, Int, DepGraph)
+mkFunnel f = let funnel = mkTube (undefined :: a)
+                 output = f $ funnel
+              in (getWatchableId funnel, getWatchableId output, compile output)
+
+instance (Datable k, Watchable v) => ContainerWatchable (Dict k v) where
   initialValueAtPath ((MapPath d):[]) (ShuffleList _ _ _) = ListData []
-  initialValueAtPath ((MapPath d):[]) (MapListDict _ _ _) = ListData []
+  initialValueAtPath ((MapPath d):[]) (MapDict _ _ _) = ListData []
 
 applyChange :: Datable a => Map.Map Int [DepGraphAction] -> Struct -> List a -> Data -> a -> Data
 applyChange dg struct input state change
@@ -213,12 +228,12 @@ filterList f l = (withRef FilterList) f l
 
 
 shuffle :: forall a k. (Datable a, Datable k)
-        => (a -> k) -> List a -> ListDict k a
+        => (a -> k) -> List a -> Dict k (List a)
 shuffle f list = (withRef ShuffleList) f list
 
-mapListDict :: forall k a b. (Datable k, Datable a, Datable b)
-            => (a -> b) -> ListDict k a -> ListDict k b
-mapListDict f d = (withRef MapListDict) f d
+mapDict :: forall k a b. (Datable k, Watchable a, Watchable b)
+        => (a -> b) -> Dict k a -> Dict k b
+mapDict f d = (withRef MapDict) f d
 
 inputList :: List a
 inputList = withRef InputList
