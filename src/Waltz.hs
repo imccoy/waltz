@@ -23,23 +23,23 @@ withRef f = f $ unsafePerformIO $ do
   return id
 
 
-data Change = ListChange ListChange
-            | IntChange IntChange
+data Change = ListChange !ListChange
+            | IntChange !IntChange
   deriving (Show)
 
-data ListChange = AddElement Data
-                | RemoveElement Data
+data ListChange = AddElement !Data
+                | RemoveElement !Data
   deriving (Show)
 
-data IntChange = AddInteger Prelude.Integer
+data IntChange = AddInteger !Prelude.Integer
   deriving (Show)
 
-data Data = ListData [Data]
-          | SetData (Set.Set Data)
-          | MapData Data (Map.Map Data Data)
-          | StructData (Map.Map Text Data)
-          | IntegerData Prelude.Integer
-          | StringData Text
+data Data = ListData ![Data]
+          | SetData !(Set.Set Data)
+          | MapData Data !(Map.Map Data Data)
+          | StructData !(Map.Map Text Data)
+          | IntegerData !Prelude.Integer
+          | StringData !Text
   deriving (Eq, Ord, Show)
 
 class Datable a where
