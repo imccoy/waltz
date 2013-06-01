@@ -12,6 +12,7 @@ Executable waltz
   Extensions: ExistentialQuantification,
               MultiParamTypeClasses,
               OverloadedStrings,
-              GADTs
+              GADTs,
+              ScopedTypeVariables
   build-depends: base, containers, text, safe
   ghc-options: -Werror -fwarn-unused-imports -fno-cse -fno-full-laziness

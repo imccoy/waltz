@@ -34,15 +34,19 @@ appState evts = W.struct [
                            ((W.mapList eventWord) . 
                             (W.filterList isNewWord))
                             evts) ,
-                 ("defns", W.ContainerThing $
-                           ((W.mapDict $ W.mapList eventDefinition) .
+                 ("defns", W.WatchableThing $
+                           ((W.mapDict (\defnEvents -> W.struct [
+                              ("bodies", W.WatchableThing $ W.mapList eventDefinition defnEvents),
+                              ("count", W.WatchableThing $ W.lengthList defnEvents)
+                            ])) .
                             (W.shuffle eventWord) .
                             (W.filterList isNewDefinition))
                             evts)
                  ]
 
 main = do let changes = [NewWord "Dog"
-                        ,NewDefinition "Dog" "Man's best friend"]
+                        ,NewDefinition "Dog" "Man's best friend"
+                        ,NewDefinition "Dog" "A Wolfish Beast"]
           let inputList = W.inputList :: (W.List Event)
           let state = appState inputList
           let initialState = W.initialValue $ state

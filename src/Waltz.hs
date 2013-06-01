@@ -1,5 +1,8 @@
 module Waltz where
 
+import Prelude hiding (Integer)
+import qualified Prelude as Prelude
+
 import Data.IORef
 import qualified Data.List as List
 import qualified Data.Map as Map
@@ -21,17 +24,21 @@ withRef f = f $ unsafePerformIO $ do
 
 
 data Change = ListChange ListChange
+            | IntChange IntChange
   deriving (Show)
 
 data ListChange = AddElement Data
                 | RemoveElement Data
   deriving (Show)
 
+data IntChange = AddInteger Prelude.Integer
+  deriving (Show)
+
 data Data = ListData [Data]
           | SetData (Set.Set Data)
-          | MapData (Map.Map Data Data)
+          | MapData Data (Map.Map Data Data)
           | StructData (Map.Map Text Data)
-          | IntegerData Integer
+          | IntegerData Prelude.Integer
           | StringData Text
   deriving (Eq, Ord, Show)
 
@@ -47,7 +54,7 @@ instance (Datable a, Ord a) => Datable (Set.Set a) where
   toData as = SetData $ Set.map toData as
   fromData (SetData ds) = Set.map fromData ds
 
-instance Datable Integer where
+instance Datable Prelude.Integer where
   toData i = IntegerData i
   fromData (IntegerData i) = i
 
@@ -56,7 +63,6 @@ instance Datable Text where
   fromData (StringData s) = s
 
 data WatchableThing = forall a. (Watchable a) => WatchableThing a
-                    | forall a. (ContainerWatchable a, Watchable a) => ContainerThing a
 
 data PathElement = StructPath Text | MapPath Data
   deriving Show
@@ -64,7 +70,7 @@ data PathElement = StructPath Text | MapPath Data
 -- the Int in the action is the thing that receives the change. The Int in the
 -- DepGraph tuple is the thing that causes it.
 data DepGraphAction = DepGraphChange Int (Change -> [Change])
-                    | DepGraphStructWalk Text
+                    | DepGraphStructWalk Int Text
                     | DepGraphMapWalk Int (Change -> Data)
 type DepGraph = [(Int, DepGraphAction)]
 
@@ -80,9 +86,6 @@ class Watchable a where
   getWatchableId :: a -> Int
   mkTube :: a -> a
 
-class (Watchable a) => ContainerWatchable a where
-  initialValueAtPath :: [PathElement] -> a -> Data
-
 data Struct = Struct Int [(Text, WatchableThing)]
 
 structLookup text (Struct _ elems) = fromJustNote ("no struct element " ++ show text) $
@@ -91,26 +94,11 @@ structLookup text (Struct _ elems) = fromJustNote ("no struct element " ++ show 
 instance Watchable Struct where
   initialValue (Struct _ elems) = StructData $ foldr addElem Map.empty elems
     where addElem (key, WatchableThing v) map = Map.insert key (initialValue v) map
-          addElem (key, ContainerThing v) map = Map.insert key (initialValue v) map
   getWatchableId (Struct id _) = id
-  compile (Struct _ structElems) = concatMap compileElem structElems
-    where compileElem (name, WatchableThing v) = (getWatchableId v, DepGraphStructWalk name):
+  compile (Struct id structElems) = concatMap compileElem structElems
+    where compileElem (name, WatchableThing v) = (getWatchableId v, DepGraphStructWalk id name):
                                                   (compile v)
-          compileElem (name, ContainerThing v) = (getWatchableId v, DepGraphStructWalk name):
-                                                  (compile v)
-  mkTube _ = error "can't mkTube struct"
-
-instance ContainerWatchable Struct where
-  initialValueAtPath ((StructPath t):[]) struct
-    = case structLookup t struct of
-        (ContainerThing c) -> initialValue c
-        (WatchableThing t) -> initialValue t
-  initialValueAtPath ((StructPath t):path) struct
-    = case structLookup t struct of
-        (ContainerThing c) -> initialValueAtPath path c
-        eek -> error $ "can't get initialValueAtPath " ++ show path
-  initialValueAtPath [] struct
-    = initialValue struct
+  mkTube _ = withRef Struct []
 
 data List a = forall b. Datable b => MapList Int (b -> a) (List b) 
             | FilterList Int (a -> Bool) (List a) 
@@ -138,30 +126,52 @@ instance (Datable a) => Watchable (List a) where
 
 data Dict k v = forall elem. (List elem ~ v, Datable elem, Watchable v) 
                 => ShuffleList Int (elem -> k) v
-              | forall v0. Watchable v0 => MapDict Int (v0 -> v) (Dict k v0)
+              | forall v0. (Watchable v0, Watchable v)
+                => MapDict Int v (v0 -> v) (Dict k v0)
+              | TubeDict Int
 
 instance (Datable k, Watchable v) => Watchable (Dict k v) where
-  initialValue _ = MapData Map.empty
+  initialValue map = MapData (valueAtKey map) Map.empty
+    where
+      valueAtKey :: forall k v. Dict k v -> Data
+      valueAtKey (ShuffleList _ _ _) = ListData []
+      valueAtKey (MapDict _ d _ _) = initialValue d
+      valueAtKey (TubeDict _) = ListData [] -- not sure what this one would mean
+  
   getWatchableId (ShuffleList n _ _) = n
-  getWatchableId (MapDict n _ _) = n
+  getWatchableId (MapDict n _ _ _) = n
+  getWatchableId (TubeDict n) = n
+
   compile (ShuffleList id f inner) = (getWatchableId inner, DepGraphMapWalk id (shufflef f)):(compile inner)
     where shufflef f (ListChange (AddElement elem)) = toData $ f $ fromData elem
           shufflef f (ListChange (RemoveElement elem)) = toData $ f $ fromData elem
 
-  compile mapDict@(MapDict id f inner) = (getWatchableId inner, DepGraphChange funnelIn (\x -> [x])):
-                                         (funnelOut, DepGraphChange id (\x -> [x])):
-                                         (funnelCompiled ++ compile inner)
+  compile mapDict@(MapDict id _ f inner) = (getWatchableId inner, DepGraphChange funnelIn (\x -> [x])):
+                                           (funnelOut, DepGraphChange id (\x -> [x])):
+                                           (funnelCompiled ++ compile inner)
     where (funnelIn, funnelOut, funnelCompiled) = mkFunnel f
-  mkTube _ = error "can't mkTube dict"
+          mkFunnel :: forall a b. (Watchable a, Watchable b) => (a -> b) -> (Int, Int, DepGraph)
+          mkFunnel f = let funnel = mkTube (undefined :: a)
+                           output = f $ funnel
+                        in (getWatchableId funnel, getWatchableId output, compile output)
+  compile (TubeDict _) = []
+  mkTube _ = withRef TubeDict
 
-mkFunnel :: forall a b. (Watchable a, Watchable b) => (a -> b) -> (Int, Int, DepGraph)
-mkFunnel f = let funnel = mkTube (undefined :: a)
-                 output = f $ funnel
-              in (getWatchableId funnel, getWatchableId output, compile output)
 
-instance (Datable k, Watchable v) => ContainerWatchable (Dict k v) where
-  initialValueAtPath ((MapPath d):[]) (ShuffleList _ _ _) = ListData []
-  initialValueAtPath ((MapPath d):[]) (MapDict _ _ _) = ListData []
+data Integer = SumInteger Int (List Prelude.Integer)
+             | TubeInteger Int
+
+instance Watchable Integer where
+  initialValue (SumInteger _ w) = IntegerData 0
+  getWatchableId (SumInteger id _) = id
+  getWatchableId (TubeInteger id) = id
+  compile (SumInteger id inner) = (getWatchableId inner, DepGraphChange id sumf):(compile inner)
+    where sumf (ListChange (AddElement (IntegerData d))) = [IntChange $ AddInteger d]
+  compile (TubeInteger _) = []
+  mkTube _ = withRef TubeInteger
+
+lengthList :: Datable a => List a -> Integer
+lengthList = (withRef SumInteger) . (mapList (\_ -> (1 :: Prelude.Integer)))
 
 applyChange :: Datable a => Map.Map Int [DepGraphAction] -> Struct -> List a -> Data -> a -> Data
 applyChange dg struct input state change
@@ -176,24 +186,33 @@ walkChanges :: Map.Map Int [DepGraphAction] -> Struct -> Int -> [PathElement] ->
 walkChanges dg struct input path state change = foldr perform state actions
   where actions = fromJustDef [] $ Map.lookup input dg
         perform (DepGraphChange id f) state
+         -- trace ("walking change " ++ show change ++ " to " ++ show (f change) ++ " at " ++ show path) $
           = foldl (walkChanges dg struct id path) state (f change) 
-        perform (DepGraphStructWalk text) state
-          = applyChangeAt struct ((StructPath text):path) ((StructPath text):path) change state
+        perform (DepGraphStructWalk id text) state
+          | getWatchableId struct == id
+         -- trace ("slamming change " ++ show change ++ " in at " ++ show ((StructPath text):path)) $
+          = applyChangeAt ((StructPath text):path) ((StructPath text):path) change state
+          | otherwise
+         -- trace ("walking change " ++ show change ++ " to path " ++ show (path ++ [StructPath text])) $
+          = walkChanges dg struct id (path ++ [StructPath text]) state change
         perform (DepGraphMapWalk id f) state
+         -- trace ("walking change " ++ show change ++ " to path " ++ show ((MapPath $ f change):path)) $
           = walkChanges dg struct id ((MapPath $ f change):path) state change
 
-applyChangeAt :: Struct -> [PathElement] -> [PathElement] -> Change -> Data -> Data
-applyChangeAt struct p0 ((StructPath t):path) change (StructData state)
-  = StructData $ Map.adjust (applyChangeAt struct p0 path change) t state
-applyChangeAt struct p0 ((MapPath d):path) change (MapData state)
-  = MapData $ Map.alter set d state
-  where set (Just v) = Just $ applyChangeAt struct p0 path change v
-        set Nothing  = Just $ applyChangeAt struct p0 path change (initialValueAtPath p0 struct)
-applyChangeAt struct p0 [] (ListChange (AddElement elem)) (ListData elems)
+applyChangeAt :: [PathElement] -> [PathElement] -> Change -> Data -> Data
+applyChangeAt p0 ((StructPath t):path) change (StructData state)
+  = StructData $ Map.adjust (applyChangeAt p0 path change) t state
+applyChangeAt p0 ((MapPath d):path) change (MapData defaultValue state)
+  = MapData d $ Map.alter set d state
+  where set (Just v) = Just $ applyChangeAt p0 path change v
+        set Nothing  = Just $ applyChangeAt p0 path change defaultValue
+applyChangeAt p0 [] (ListChange (AddElement elem)) (ListData elems)
   = ListData (elem:elems)
-applyChangeAt struct p0 [] (ListChange (RemoveElement elem)) (ListData elems)
+applyChangeAt p0 [] (ListChange (RemoveElement elem)) (ListData elems)
   = ListData (List.delete elem elems)
-applyChangeAt struct p0 path change d
+applyChangeAt p0 [] (IntChange (AddInteger n1)) (IntegerData n)
+  = IntegerData $ n + n1
+applyChangeAt p0 path change d
   = error $ "applyChangeAt got path " ++ show path ++ ", change " ++ show change ++ ", and data " ++ show d
 
 {-
@@ -233,7 +252,12 @@ shuffle f list = (withRef ShuffleList) f list
 
 mapDict :: forall k a b. (Datable k, Watchable a, Watchable b)
         => (a -> b) -> Dict k a -> Dict k b
-mapDict f d = (withRef MapDict) f d
+mapDict f d = ((withRef MapDict) (f $ dictValueWatcher d) f d)
+
+dictValueWatcher :: Dict k v -> v
+dictValueWatcher (ShuffleList _ _ _) = inputList
+dictValueWatcher (MapDict _ innerDefaultWatcher _ _) = innerDefaultWatcher
+
 
 inputList :: List a
 inputList = withRef InputList
