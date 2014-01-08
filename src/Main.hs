@@ -33,9 +33,9 @@ appState evts = W.struct [
                  ("words", W.WatchableThing $
                            ((W.mapList eventWord) . 
                             (W.filterList isNewWord))
-                            evts) ,
+                            evts),
                  ("defns", W.WatchableThing $
-                           ((W.mapDict (\defnEvents -> W.struct [
+                           ((W.mapDict (\defnEvents -> W.structN 100 [
                               ("bodies", W.WatchableThing $ W.mapList eventDefinition defnEvents),
                               ("count", W.WatchableThing $ W.lengthList defnEvents)
                             ])) .
@@ -50,6 +50,9 @@ main = do let changes = [NewWord "Dog"
           let inputList = W.inputList :: (W.List Event)
           let state = appState inputList
           let initialState = W.initialValue $ state
-          let compiled = W.fullCompile $ state
-          let finalState = foldl (W.applyChange compiled state inputList) initialState changes
+          putStrLn (W.pprint 0 state)
+          let compiled = W.fullCompile $ W.WatchableThing state
+          let finalState = foldl (W.applyChange compiled state inputList)
+                                 initialState
+                                 [W.ListImpulse $ W.AddElement $ W.toData c | c <- (reverse changes)]
           print $ show finalState
