@@ -48,7 +48,7 @@ data IntImpulse = AddInteger !Prelude.Integer
 data Data = ListData ![Data]
           | SetData !(Set.Set Data)
           | MapData Int !Data !(Map.Map Data Data)
-          | StructData Int  !(Map.Map Text Data)
+          | StructData Int !(Map.Map Text Data)
           | IntegerData !Prelude.Integer
           | StringData !Text
   deriving (Eq, Ord, Show)
@@ -78,7 +78,7 @@ data WatchableThing = forall a. (Watchable a) =>
 
 wtId (WatchableThing a) = getWatchableId a
 wtInners (WatchableThing a) = getInners a
-wtFeedingInners (WatchableThing a) = getFeedingInners a
+wtInitialValue (WatchableThing a) = initialValue a
 
 addToChangeContext loc pathElement (Change cxt impulse) = [Change cxt' impulse]
   where cxt' = Map.insert loc pathElement cxt
@@ -93,13 +93,11 @@ class PPrint a => Watchable a where
   initialValue :: a -> Data
   compile :: a -> Compiled
   getWatchableId :: a -> Int
-  mkTube :: a -> a
+  mkTube :: WatchableThing -> a
   getInners :: a -> [WatchableThing]
 
-  getFeedingInners :: a -> [WatchableThing]
-  getFeedingInners = getInners
-
 data Struct = Struct Int [StructElem]
+            | TubeStruct Int WatchableThing
 instance Watchable Struct where
   initialValue (Struct id elems) = StructData id $ foldr addElem Map.empty elems
     where addElem elem@(StructElem _ _ key _) map = Map.insert key (initialValue elem) map
@@ -107,7 +105,7 @@ instance Watchable Struct where
   compile (Struct id structElems) = return
   getInners struct@(Struct id structElems)
    = map WatchableThing structElems
-  mkTube _ = withRef Struct []
+  mkTube = (withRef TubeStruct)
 
 data StructElem = StructElem Int Struct Text WatchableThing
 
@@ -123,12 +121,14 @@ instance Watchable StructElem where
 data List a = forall b. Datable b => MapList Int (b -> a) (List b) 
             | FilterList Int (a -> Bool) (List a) 
             | InputList Int
+            | TubeList Int WatchableThing
 
 instance (Datable a) => Watchable (List a) where
   initialValue _ = ListData []
   getWatchableId (MapList n _ _) = n
   getWatchableId (FilterList n _ _) = n
   getWatchableId (InputList n) = n
+  getWatchableId (TubeList n _) = n
 
   compile (MapList id f inner) (Change cxt impulse) = [Change cxt (mapf f impulse)]
     where mapf f (ListImpulse (AddElement elem)) = ListImpulse (AddElement (toData $ f $ fromData elem))
@@ -141,12 +141,14 @@ instance (Datable a) => Watchable (List a) where
             | f $ fromData elem = [ListImpulse (RemoveElement elem)]
             | otherwise = []
   compile (InputList n) c = [c]
+  compile (TubeList n _) c = [c]
 
   getInners (MapList _ _ i) = [WatchableThing i]
   getInners (FilterList _ _ i) = [WatchableThing i]
   getInners (InputList _) = []
+  getInners (TubeList _ i) = [i]
 
-  mkTube _ = withRef InputList
+  mkTube = withRef TubeList
 
 data Dict k v = forall elem. (List elem ~ v, Datable elem, Watchable v) 
                 => ShuffleList Int (elem -> k) v
@@ -156,8 +158,8 @@ data Dict k v = forall elem. (List elem ~ v, Datable elem, Watchable v)
                            (v0 -> v)          -- map function
                            Compiled
                            v
-                           (MapDictProcessor k v0)       -- tube for values going into the map function
-              | TubeDict Int
+                           (Dict k v0)        -- inner
+              | TubeDict Int WatchableThing
 
 instance (Datable k, Watchable v) => Watchable (Dict k v) where
   initialValue map = inner `seq` MapData inner
@@ -168,64 +170,41 @@ instance (Datable k, Watchable v) => Watchable (Dict k v) where
       valueAtKey :: forall k v. Dict k v -> Data
       valueAtKey (ShuffleList _ _ _) = ListData []
       valueAtKey (MapDict _ d _ _ _ _) = initialValue d
-      valueAtKey (TubeDict _) = ListData [] -- not sure what this one would mean
+      valueAtKey (TubeDict _ v) = wtInitialValue v
   
   getWatchableId (ShuffleList n _ _) = n
   getWatchableId (MapDict n _ _ _ _ _) = n
-  getWatchableId (TubeDict n) = n
+  getWatchableId (TubeDict n _) = n
 
   compile (ShuffleList id f inner) c@(Change cxt impulse) = addToChangeContext id (MapPath $ shufflef f impulse) c
     where shufflef f (ListImpulse (AddElement elem)) = toData $ f $ fromData elem
           shufflef f (ListImpulse (RemoveElement elem)) = toData $ f $ fromData elem
 
   compile mapDict@(MapDict id _ _ compiled _ _) c = compiled c
-  compile (TubeDict _) c = [c]
+  compile (TubeDict _ v) c = [c]
 
-  mkTube _ = withRef TubeDict
+  mkTube = withRef TubeDict
   getInners (ShuffleList _ _ inner) = [WatchableThing inner]
-  getInners (MapDict id _ _ _ output mapDictProcessor) = [WatchableThing output, WatchableThing mapDictProcessor]
-  getFeedingInners (MapDict id _ _ _ output _) = [WatchableThing output]
-  getFeedingInners d = getInners d
+  getInners (MapDict id _ _ _ output inner) = [WatchableThing output]
 
-
-data MapDictProcessor k v = MapDictProcessor Int WatchableThing (Dict k v)
-instance (Datable k, Watchable v) => Watchable (MapDictProcessor k v) where
-  initialValue _ = error "No initial value for MapDictProcessor"
-  getWatchableId (MapDictProcessor id _ _) = id
-  compile (MapDictProcessor _ _ _) = const []
-  getFeedingInners (MapDictProcessor _ _ inner) = [WatchableThing inner]
-  getInners p = [WatchableThing $ mapDictInput p]
-  mkTube _ = error "no mkTube MapDictProcessor"
-
-mapDictInput (MapDictProcessor _ funnelId inner) = MapDictInput inner funnelId
-
-data MapDictInput k v = MapDictInput (Dict k v) -- src
-                                     WatchableThing -- dst
-instance (Datable k, Watchable v) => Watchable (MapDictInput k v) where
-  initialValue _ = error "No initial value for MapDictInput"
-  getWatchableId (MapDictInput src dst) = wtId dst
-  compile (MapDictInput _ _) = return
-  getInners        (MapDictInput src dst) = [WatchableThing src]
-  getFeedingInners (MapDictInput src dst) = [WatchableThing src]
-  mkTube _ = error "no mkTube MapDictInput"
 
 ultimateInnerDict :: (Datable k, Watchable v) => Dict k v -> Int
 ultimateInnerDict (ShuffleList id _ _) = id
-ultimateInnerDict (MapDict id _ _ _ _ (MapDictProcessor _ _ i)) = ultimateInnerDict i
+ultimateInnerDict (MapDict id _ _ _ _ inner) = ultimateInnerDict inner
           
 
 
 data Integer = SumInteger Int (List Prelude.Integer)
-             | TubeInteger Int
+             | TubeInteger Int WatchableThing
 
 instance Watchable Integer where
   initialValue (SumInteger _ w) = IntegerData 0
   getWatchableId (SumInteger id _) = id
-  getWatchableId (TubeInteger id) = id
+  getWatchableId (TubeInteger id _) = id
   compile (SumInteger id inner) (Change cxt impulse) = [Change cxt (sumf impulse)]
     where sumf (ListImpulse (AddElement (IntegerData d))) = IntImpulse $ AddInteger d
-  compile (TubeInteger _) c = [c]
-  mkTube _ = withRef TubeInteger
+  compile (TubeInteger _ _) c = [c]
+  mkTube = withRef TubeInteger
   getInners (SumInteger id inner) = [WatchableThing inner]
 
 
@@ -237,27 +216,28 @@ fullCompile :: WatchableThing -> (LandingSite, Propagators, Modifiers)
 fullCompile w = (wtId w, compilePropagators w, compileModifiers w)
 
 compilePropagators :: WatchableThing -> Propagators
-compilePropagators w = compilePropagators' (wtId w) w
-compilePropagators' :: Int -> WatchableThing -> Propagators
-compilePropagators' to w = trace (show to ++ ": adding propagators " ++ show these) $
-                                 Map.unionWith (++) those these
-  where these = Map.fromList $ map (\w -> (wtId w, [to])) (wtFeedingInners w) -- jumps from my inners to me
-        those = Map.unionsWith (++) $ map compilePropagators (wtInners w)     -- jumps within my inners
+compilePropagators = (foldr compilePropagators' Map.empty) . allWatchables
+compilePropagators' :: WatchableThing -> Propagators -> Propagators
+compilePropagators' (WatchableThing to) m
+  = trace (show (getWatchableId to) ++ ":  adding propagators " ++ show (map wtId (getInners to))) $
+    foldr go m (getInners to)
+  where go :: WatchableThing -> Propagators -> Propagators
+        go (WatchableThing from) m = add from to m
+        add from to m = Map.insert (getWatchableId from)
+                                   ((getWatchableId to):(old from m))
+                                   m
+        old from m = Map.findWithDefault [] (getWatchableId from) m
+
 
 compileModifiers = (foldr compileOne Map.empty) . allWatchables
   where compileOne (WatchableThing w) = trace (show (getWatchableId w) ++ ": compiling modifiers") $
                                         Map.insert (getWatchableId w)
                                                    (compile w)
 
-allWatchables w = w:(concat (map allWatchables $ wtInners w))
--- allWatchables w = Map.elems $ go w Map.empty
---   where go w m
---          | Map.member (wtId w) m = m
---          | otherwise             = foldr go
---                                          (Map.insert (wtId w) w m)
---                                          (wtInners w)
--- 
-
+allWatchables w = uniqBy wtId $ allWatchables' w
+allWatchables' w = w:(concat (map allWatchables $ wtInners w))
+uniqBy f [] = []
+uniqBy f (w:ws) = w:(uniqBy f [w' | w' <- ws, f w /= f w'])
 
 getLandingChanges :: (LandingSite, Propagators, Modifiers) -> Impulse -> Int -> [Change]
 getLandingChanges compiled imp loc = getLandingChanges' compiled change loc
@@ -330,14 +310,13 @@ mapDict f d = (withRef MapDict) def
                                 f
                                 compiled
                                 output
-                                processor
+                                d
   where def = f $ dictValueWatcher d
-        funnel = mkTube (undefined :: v0)
+        funnel = mkTube $ WatchableThing d
         output = f $ funnel -- TODO confirm application of f to different
                             --      funnels yields watchables with different
                             --      ids.
         compiled = compile output
-        processor = ((withRef MapDictProcessor) (WatchableThing funnel) d)
 
 dictValueWatcher :: Dict k v -> v
 dictValueWatcher (ShuffleList _ _ _) = inputList
@@ -348,7 +327,7 @@ inputList :: List a
 inputList = withRef InputList
 
 struct :: [(Text, WatchableThing)] -> Struct
-struct =  withRef structN
+struct elemTuples = (withRef structN) elemTuples
 
 structN n elemTuples = let struct = Struct n elems
                            elems = [(withRef StructElem) struct t w
@@ -376,23 +355,16 @@ instance PPrint (List a) where
   pprint d (MapList id f inner) = pprintw d "MapList" id [pprint (d+1) inner]
   pprint d (FilterList id f inner) = pprintw d "FilterList" id [pprint (d+1)  inner]
   pprint d (InputList id) = pprintw d "InputList" id []
+  pprint d (TubeList id inner) = pprintw d "TubeList" id [pprint (d+1) inner]
 
 instance (Datable k, Watchable v) => PPrint (Dict k v) where
   pprint d (ShuffleList id f inner) = pprintw d "ShuffleList" id [pprint (d+1) inner]
-  pprint d (MapDict id def f compiled outTube mapDictProcessor)
-     = pprintw d "MapDict" id [replicate (d*4 + 2) ' ' ++ "Processor,", pprint (d+1) mapDictProcessor,
+  pprint d (MapDict id def f compiled outTube inner)
+     = pprintw d "MapDict" id [replicate (d*4 + 2) ' ' ++ "Inner,", pprint (d+1) inner,
                                replicate (d*4 + 2) ' ' ++ "OutTube,", pprint (d+1) outTube]
-  pprint d (TubeDict id) = pprintw d "TubeDict" id []
-instance (Datable k, Watchable v) => PPrint (MapDictProcessor k v) where
-  pprint d p@(MapDictProcessor id funnel inner)
-     = pprintw d "MapDictProcessor" id [replicate (d*4+2) ' ' ++ "funnel,", pprint (d+1) funnel,
-                                        replicate (d*4+2) ' ' ++ "inner", pprint (d+1) inner,
-                                        replicate (d*4+2) ' ' ++ "input", pprint (d+1) (mapDictInput p)]
-instance (Datable k, Watchable v) => PPrint (MapDictInput k v) where
-  pprint d (MapDictInput src dst)
-     = replicate (d*4) ' ' ++ "MapDictInput " ++ show (getWatchableId src) ++ " -> " ++ show (wtId dst)
+  pprint d (TubeDict id inner) = pprintw d "TubeDict" id [pprint (d+1) inner]
 
 instance PPrint Integer where
   pprint d (SumInteger id inner) = pprintw d "SumInteger" id [pprint (d+1) inner]
-  pprint d (TubeInteger id) = pprintw d "TubeInteger" id []
+  pprint d (TubeInteger id _) = pprintw d "TubeInteger" id []
 

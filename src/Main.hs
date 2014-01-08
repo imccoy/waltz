@@ -35,7 +35,7 @@ appState evts = W.struct [
                             (W.filterList isNewWord))
                             evts),
                  ("defns", W.WatchableThing $
-                           ((W.mapDict (\defnEvents -> W.structN 100 [
+                           ((W.mapDict (\defnEvents -> W.structN 1000 [
                               ("bodies", W.WatchableThing $ W.mapList eventDefinition defnEvents),
                               ("count", W.WatchableThing $ W.lengthList defnEvents)
                             ])) .
