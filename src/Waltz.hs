@@ -28,6 +28,9 @@ withRef f = f $ unsafePerformIO $ do
   writeIORef idRef (id + 1)
   return id
 
+withRef2 :: (Int -> a) -> (Int -> b) -> (a, b)
+withRef2 f1 f2 = withRef (\n -> (f1 n, f2 n))
+
 
 data Change = Change Context Impulse
   deriving (Show)
@@ -80,8 +83,8 @@ wtId (WatchableThing a) = getWatchableId a
 wtInners (WatchableThing a) = getInners a
 wtInitialValue (WatchableThing a) = initialValue a
 
-addToChangeContext loc pathElement (Change cxt impulse) = [Change cxt' impulse]
-  where cxt' = Map.insert loc pathElement cxt
+addToChangeContext node pathElement (Change cxt impulse) = [Change cxt' impulse]
+  where cxt' = Map.insert node pathElement cxt
 
 
 data PathElement = StructPath Text | MapPath Data
@@ -155,42 +158,41 @@ data Dict k v = forall elem. (List elem ~ v, Datable elem, Watchable v)
               | forall v0. (Watchable v0, Watchable v)
                 => MapDict Int                -- id
                            v                  -- default value in result
-                           (v0 -> v)          -- map function
-                           Compiled
+                           (v0 -> v)    -- map function
                            v
                            (Dict k v0)        -- inner
               | TubeDict Int WatchableThing
 
 instance (Datable k, Watchable v) => Watchable (Dict k v) where
-  initialValue map = inner `seq` MapData inner
-                                         (valueAtKey map)
-                                         Map.empty
+  initialValue map = MapData inner
+                             (valueAtKey map)
+                             Map.empty
     where
       inner = ultimateInnerDict map
       valueAtKey :: forall k v. Dict k v -> Data
       valueAtKey (ShuffleList _ _ _) = ListData []
-      valueAtKey (MapDict _ d _ _ _ _) = initialValue d
+      valueAtKey (MapDict _ d _ _ _) = initialValue d
       valueAtKey (TubeDict _ v) = wtInitialValue v
   
   getWatchableId (ShuffleList n _ _) = n
-  getWatchableId (MapDict n _ _ _ _ _) = n
+  getWatchableId (MapDict n _ _ _ _) = n
   getWatchableId (TubeDict n _) = n
 
   compile (ShuffleList id f inner) c@(Change cxt impulse) = addToChangeContext id (MapPath $ shufflef f impulse) c
     where shufflef f (ListImpulse (AddElement elem)) = toData $ f $ fromData elem
           shufflef f (ListImpulse (RemoveElement elem)) = toData $ f $ fromData elem
 
-  compile mapDict@(MapDict id _ _ compiled _ _) c = compiled c
+  compile mapDict@(MapDict id _ _ v _) c = compile v c
   compile (TubeDict _ v) c = [c]
 
   mkTube = withRef TubeDict
   getInners (ShuffleList _ _ inner) = [WatchableThing inner]
-  getInners (MapDict id _ _ _ output inner) = [WatchableThing output]
+  getInners (MapDict id _ _ output inner) = [WatchableThing output]
 
 
 ultimateInnerDict :: (Datable k, Watchable v) => Dict k v -> Int
 ultimateInnerDict (ShuffleList id _ _) = id
-ultimateInnerDict (MapDict id _ _ _ _ inner) = ultimateInnerDict inner
+ultimateInnerDict (MapDict id _ _ _ inner) = ultimateInnerDict inner
           
 
 
@@ -240,24 +242,24 @@ uniqBy f [] = []
 uniqBy f (w:ws) = w:(uniqBy f [w' | w' <- ws, f w /= f w'])
 
 getLandingChanges :: (LandingSite, Propagators, Modifiers) -> Impulse -> Int -> [Change]
-getLandingChanges compiled imp loc = getLandingChanges' compiled change loc
+getLandingChanges compiled imp node = getLandingChanges' compiled change node
   where change = Change Map.empty imp
 
 getLandingChanges' :: (LandingSite, Propagators, Modifiers) -> Change -> Int -> [Change]
-getLandingChanges' compiled@(landingSite, propss, mods) change loc
+getLandingChanges' compiled@(landingSite, propss, mods) change node
   = landing ++ (concat [ getLandingChanges' compiled c l
-                       | l <- trace (show loc ++ ": jumping to " ++ show props) props,
-                         c <- trace (show loc ++ ": transforming " ++ show change) $
-                              trace (show loc ++ ": to " ++ show changes) $
+                       | l <- trace (show node ++ ": jumping to " ++ show props) props,
+                         c <- trace (show node ++ ": transforming " ++ show change) $
+                              trace (show node ++ ": to " ++ show changes) $
                                     changes
                        ])
-  where props = maybe [] id $ Map.lookup loc propss
-        mod = fromJustNote ("No modifier for " ++ show loc) $ Map.lookup loc mods
+  where props = maybe [] id $ Map.lookup node propss
+        mod = fromJustNote ("No modifier for " ++ show node) $ Map.lookup node mods
         changes = mod change
-        landing = if loc == landingSite then [change] else []
+        landing = if node == landingSite then [change] else []
 
-applyChange compiled stateWatchable locWatchable stateValue impulse
-  = let landingChanges = getLandingChanges compiled impulse (getWatchableId locWatchable)
+applyChange compiled stateWatchable nodeWatchable stateValue impulse
+  = let landingChanges = getLandingChanges compiled impulse (getWatchableId nodeWatchable)
      in applyChanges stateWatchable landingChanges stateValue
 
 applyChanges stateWatchable changes stateValue
@@ -307,20 +309,21 @@ shuffle f list = (withRef ShuffleList) f list
 mapDict :: forall k v0 v. (Datable k, Watchable v0, Watchable v)
         => (v0 -> v) -> Dict k v0 -> Dict k v
 mapDict f d = (withRef MapDict) def
-                                f
-                                compiled
-                                output
-                                d
-  where def = f $ dictValueWatcher d
+                             f
+                             output
+                             d
+  where 
+        def = f (dictValueWatcher d)
         funnel = mkTube $ WatchableThing d
-        output = f $ funnel -- TODO confirm application of f to different
-                            --      funnels yields watchables with different
-                            --      ids.
+        output = f funnel -- TODO confirm application of f to different
+                          --      funnels yields watchables with different
+                          --      ids.
         compiled = compile output
+
 
 dictValueWatcher :: Dict k v -> v
 dictValueWatcher (ShuffleList _ _ _) = inputList
-dictValueWatcher (MapDict _ innerDefaultWatcher _ _ _ _) = innerDefaultWatcher
+dictValueWatcher (MapDict _ innerDefaultWatcher _ _ _) = innerDefaultWatcher
 
 
 inputList :: List a
@@ -359,7 +362,7 @@ instance PPrint (List a) where
 
 instance (Datable k, Watchable v) => PPrint (Dict k v) where
   pprint d (ShuffleList id f inner) = pprintw d "ShuffleList" id [pprint (d+1) inner]
-  pprint d (MapDict id def f compiled outTube inner)
+  pprint d (MapDict id def f outTube inner)
      = pprintw d "MapDict" id [replicate (d*4 + 2) ' ' ++ "Inner,", pprint (d+1) inner,
                                replicate (d*4 + 2) ' ' ++ "OutTube,", pprint (d+1) outTube]
   pprint d (TubeDict id inner) = pprintw d "TubeDict" id [pprint (d+1) inner]
