@@ -28,9 +28,6 @@ withRef f = f $ unsafePerformIO $ do
   writeIORef idRef (id + 1)
   return id
 
-withRef2 :: (Int -> a) -> (Int -> b) -> (a, b)
-withRef2 f1 f2 = withRef (\n -> (f1 n, f2 n))
-
 
 data Change = Change Context Impulse
   deriving (Show)
