@@ -30,28 +30,27 @@ eventDefinition _ = error "no definition"
 
 appState :: W.List Event -> W.Struct
 appState evts = W.struct [
-                 ("words", W.WatchableThing $
+                 ("words", W.AnyNode $
                            ((W.mapList eventWord) . 
                             (W.filterList isNewWord))
                             evts),
-                 ("defns", W.WatchableThing $ let
-                             defnEvents = W.filterList isNewDefinition evts :: W.List Event
-                             eventsByWord = W.shuffle eventWord defnEvents :: W.Dict Text (W.List Event)
-                           in W.mapDict defnEntry eventsByWord)
+                 ("defns", W.AnyNode $
+                           ((W.mapDict (\defnEvents -> W.structN 1000 [
+                              ("bodies", W.AnyNode $ W.mapList eventDefinition defnEvents),
+                              ("count", W.AnyNode $ W.lengthList defnEvents)
+                            ])) .
+                            (W.shuffle eventWord) .
+                            (W.filterList isNewDefinition))
+                            evts)
                  ]
-  where defnEntry :: W.List Event -> W.Struct
-        defnEntry defnEvents = W.structN 1000 [
-                                 ("bodies", W.WatchableThing $ W.mapList eventDefinition defnEvents),
-                                 ("count", W.WatchableThing $ W.lengthList defnEvents)
-                               ]
 
 main = do let changes = [NewWord "Dog"
                         ,NewDefinition "Dog" "Man's best friend"
                         ,NewDefinition "Dog" "A Wolfish Beast"]
           let inputList = W.inputList :: (W.List Event)
           let state = appState inputList
-          let initialState = W.watchableInitialValue $ state
-          let compiled = W.fullCompile $ W.WatchableThing state
+          let initialState = W.nodeInitialValue $ state
+          let compiled = W.fullCompile $ W.AnyNode state
           let finalState = foldl (W.applyChange compiled state inputList)
                                  initialState
                                  [W.ListImpulse $ W.AddElement $ W.toData c | c <- (reverse changes)]
