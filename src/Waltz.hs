@@ -46,8 +46,8 @@ data IntImpulse = AddInteger !Prelude.Integer
 
 data Data = ListData ![Data]
           | SetData !(Set.Set Data)
-          | MapData Int !Data !(Map.Map Data Data)
-          | StructData Int !(Map.Map Text Data)
+          | MapData !Int !Data !(Map.Map Data Data)
+          | StructData !Int !(Map.Map Text Data)
           | IntegerData !Prelude.Integer
           | StringData !Text
   deriving (Eq, Ord, Show)
@@ -72,22 +72,24 @@ instance Datable Text where
   toData s = StringData s
   fromData (StringData s) = s
 
-data AnyNode = forall a. (Watchable a) => AnyNode (Node a)
+
+
+data AnyNode = forall a. (Watchable a, PPrint a) => AnyNode !(Node a)
 
 
 addToChangeContext node pathElement (Change cxt impulse) = [Change cxt' impulse]
   where cxt' = Map.insert node pathElement cxt
 
 data PathElement = StructPath Text | MapPath Data
-  deriving Show
+  deriving (Show, Eq)
 
 type Compiled = Change -> [Change]
 
-class Watchable a where
+class PPrint a => Watchable a where
   initialValue :: Int -> [AnyNode] -> a -> Data
   compile :: a -> Compiled
 
-data Node a = Node Int [AnyNode] a | Tube Int [AnyNode]
+data Node a = Node !Int [AnyNode] a | Tube !Int [AnyNode]
 
 nodeId (Node id _ _) = id
 nodeId (Tube id _) = id
@@ -156,22 +158,24 @@ data DictW k v = forall elem. (Datable elem)
 
 instance (Datable k, Watchable v) => Watchable (DictW k (Node v)) where
   initialValue id inners map = MapData inner
-                                       (valueAtKey map)
+                                       (dictMembersDefaultValue map)
                                        Map.empty
     where
-      inner = ultimateInnerDict map
-      valueAtKey (ShuffleList _ _) = ListData []
-      valueAtKey (MapDict _ d _) = d
+      inner = dictShuffler map
   
   compile (ShuffleList id f) c@(Change cxt impulse) = addToChangeContext id (MapPath $ shufflef f impulse) c
     where shufflef f (ListImpulse (AddElement elem)) = toData $ f $ fromData elem
           shufflef f (ListImpulse (RemoveElement elem)) = toData $ f $ fromData elem
 
-  compile mapDict@(MapDict _ _ v) c = nodeCompile v c
+  compile (MapDict _ _ v) c = [c]
 
-ultimateInnerDict :: DictW k v -> Int
-ultimateInnerDict (ShuffleList id _) = id
-ultimateInnerDict (MapDict id _ _) = id
+dictMembersDefaultValue (ShuffleList _ _) = ListData []
+dictMembersDefaultValue (MapDict _ d _) = d
+
+dictShuffler :: DictW k v -> Int
+dictShuffler (ShuffleList id _) = id
+dictShuffler (MapDict id _ _) = id
+
 
 type Integer = Node IntegerW
 data IntegerW = SumInteger
@@ -241,13 +245,13 @@ applyChanges stateWatchable changes stateValue
           stateValue changes
 
 applyLandingChange (Change context impulse) (MapData id def map)
-  = MapData id def $ Map.alter (maybe (trace "defaulting" $ Just $ applyLandingChange (Change context impulse) def)
-                                      (Just . (applyLandingChange (Change context impulse))))
+  = MapData id def $ Map.alter go
                                p
                                map
   where pElem = fromJustNote ("can't find context for map " ++ show id) $
                              Map.lookup id context
         (MapPath p) = pElem
+        go = Just . applyLandingChange (Change context impulse) . fromJustDef def
 applyLandingChange (Change context impulse) (StructData id struct)
   = StructData id  $ Map.alter (fmap (applyLandingChange $ Change context impulse))
                                p
@@ -288,7 +292,7 @@ mapDict f d = mkWatchable [AnyNode output]
                           (MapDict context def output)
   where 
         context :: Int
-        context = ultimateInnerDict (nodeW d)
+        context = dictShuffler (nodeW d)
         def :: Data
         def = nodeInitialValue output
         funnel :: Node v0
@@ -311,3 +315,29 @@ structN n elemTuples = let struct = Node n (map AnyNode elems) (Struct elems)
                                    |(t,w) <- elemTuples]
                         in struct
 
+class PPrint a where
+  pprint :: a -> String
+
+instance PPrint StructW where
+  pprint (Struct _) = "Struct"
+instance PPrint StructElemW where
+  pprint (StructElem _ text) = show text
+instance PPrint (ListW a) where
+  pprint (MapList _) = "MapList"
+  pprint (FilterList _) = "FilterList"
+instance PPrint (DictW k v) where
+  pprint (ShuffleList _ _) = "ShuffleList"
+  pprint (MapDict _ _ _) = "MapDict"
+instance PPrint (IntegerW) where
+  pprint (SumInteger) = "SumInteger"
+
+printNode :: Watchable a => Node a -> String
+printNode node = show (nodeId node) ++ ":" ++ nodeString ++ 
+                      "[\n" ++ 
+                      unlines ["  " ++ l | l <- concatMap lines innerStrings] ++ 
+                      "\n]"
+  where innerStrings = map (\(AnyNode n) -> printNode n)
+                           (nodeInners node)
+        nodeString = case node of
+                       Tube _ _ -> "Tube"
+                       Node _ _ w -> pprint w
