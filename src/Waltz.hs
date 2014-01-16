@@ -6,7 +6,6 @@ import qualified Prelude as Prelude
 import Control.Monad.State
 import qualified Data.List as List
 import qualified Data.Map as Map
-import qualified Data.Set as Set
 import Data.Text (Text)
 import Safe
 
@@ -33,12 +32,21 @@ data IntImpulse = AddInteger !Prelude.Integer
   deriving (Show)
 
 data Data = ListData ![Data]
-          | SetData !(Set.Set Data)
           | MapData !Int !Data !(Map.Map Data Data)
           | StructData !Int !(Map.Map Text Data)
           | IntegerData !Prelude.Integer
           | StringData !Text
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord)
+
+instance Show Data where
+  show x = showData x
+
+showData (ListData xs) = show xs
+showData (MapData _ _ m) = show m
+showData (StructData _ m) = show m
+showData (IntegerData i) = show i
+showData (StringData t) = show t
+
 
 class Datable a where
   toData :: a -> Data
@@ -47,10 +55,6 @@ class Datable a where
 instance Datable a => Datable [a] where
   toData as = ListData $ map toData as
   fromData (ListData ds) = map fromData ds
-
-instance (Datable a, Ord a) => Datable (Set.Set a) where
-  toData as = SetData $ Set.map toData as
-  fromData (SetData ds) = Set.map fromData ds
 
 instance Datable Prelude.Integer where
   toData i = IntegerData i
@@ -144,6 +148,9 @@ data DictW k v = forall elem. (Datable elem)
                                      --  applying the map function to a tube being
                                      --  filled by the dict being mapped over
 
+data DictKey k = DictKey Int  -- the id of the (shuffled) map whose value we
+                              -- we are looking up
+
 instance (Datable k, Watchable v) => Watchable (DictW k (Node v)) where
   initialValue id inners map = MapData inner
                                        (dictMembersDefaultValue map)
@@ -164,6 +171,17 @@ dictShuffler :: DictW k v -> Int
 dictShuffler (ShuffleList id _) = id
 dictShuffler (MapDict id _ _) = id
 
+
+type DictLookup k v = Node (DictLookupW k)
+data DictLookupW k = DictLookup (DictKey k) Int Data
+
+instance Watchable (DictLookupW v) where
+  initialValue _ _ (DictLookup (DictKey _) _ def) = def
+  compile (DictLookup (DictKey contextId) dictId _) change@(Change cxt _)
+    = trace ("picked up a " ++ show p ++ " from " ++ show contextId ++ " for " ++ show dictId) $ 
+      addToChangeContext contextId p change
+    where p = fromJustNote ("DictLookup " ++ show contextId ++ "->" ++ show dictId ++ " stymied") $
+                             Map.lookup dictId cxt
 
 type Integer = Node IntegerW
 data IntegerW = SumInteger
@@ -227,8 +245,9 @@ applyChange compiled stateWatchable nodeWatchable stateValue impulse
 
 applyChanges stateWatchable changes stateValue
   = foldr (\c s -> let result = applyLandingChange c s
-                    in trace ("applying change " ++ show c ++ "\nin " ++ show s) $
-                       trace ("yielding " ++  show result ++ "\n\n") $
+                    in trace ("applying change " ++ show c ++ 
+                              "\n  to state " ++ show s ++ 
+                              "\n  yielding " ++ show result) $
                        applyLandingChange c s)
           stateValue changes
 
@@ -286,15 +305,25 @@ shuffle f l = do id <- getNextId
 
 mapDict :: forall k v0 v. (Datable k, Watchable v0, Watchable v)
         => ((Node v0) -> Func (Node v)) -> Dict k (Node v0) -> Func (Dict k (Node v))
-mapDict f d = do funnelId <- getNextId
-                 let funnel = Tube funnelId [AnyNode d]
-                 output <- f funnel
-                 let def = nodeInitialValue output
-                 mkWatchable [AnyNode output]
-                             (MapDict context def output)
-  where 
-        context :: Int
-        context = dictShuffler (nodeW d)
+mapDict f = mapDictWithKey (\k v -> f v)
+
+mapDictWithKey :: forall k v0 v. (Datable k, Watchable v0, Watchable v)
+               => (DictKey k -> Node v0 -> Func (Node v)) -> Dict k (Node v0) -> Func (Dict k (Node v))
+mapDictWithKey f d = do funnelId <- getNextId
+                        let funnel = Tube funnelId [AnyNode d]
+                        output <- f (DictKey context) funnel
+                        let def = nodeInitialValue output
+                        mkWatchable [AnyNode output]
+                                    (MapDict context def output)
+      where   
+            context :: Int
+            context = dictShuffler (nodeW d)
+
+
+dictLookup :: (Datable k, Watchable v) => DictKey k -> Dict k (Node v) -> Func (DictLookup k v)
+dictLookup key map = mkWatchable [AnyNode map] (DictLookup key
+                                                           (dictShuffler $ nodeW map)
+                                                           (dictMembersDefaultValue $ nodeW map))
 
 
 inputList :: Func (List a)
@@ -326,6 +355,8 @@ instance PPrint (ListW a) where
 instance PPrint (DictW k v) where
   pprint (ShuffleList _ _) = "ShuffleList"
   pprint (MapDict _ _ _) = "MapDict"
+instance PPrint (DictLookupW v) where
+  pprint (DictLookup _ _ _) = "DictLookup"
 instance PPrint (IntegerW) where
   pprint (SumInteger) = "SumInteger"
 

@@ -4,7 +4,7 @@ import Control.Monad.State
 import Data.Text (Text)
 
 data Event = NewWord Text
-           | NewDefinition Text Text
+               | NewDefinition Text Text
 
 instance Datable Event where
   toData (NewWord s) = toData ["NewWord", s]
@@ -30,25 +30,28 @@ eventDefinition (NewDefinition _ d) = d
 eventDefinition _ = error "no definition"
 
 appState :: W.List Event -> W.Func W.Struct
-appState evts = W.struct [
-                 ("words", fmap W.AnyNode $ 
-                           return evts >>= 
-                           W.filterList isNewWord >>= 
-                           W.mapList eventWord),
-                 ("defns", fmap W.AnyNode $
-                           return evts >>=
-                           W.filterList isNewDefinition >>=
-                           W.shuffle eventWord >>=
-                           W.mapDict (\defnEvents -> W.struct [
-                                      ("bodies", fmap W.AnyNode $
-                                                 return defnEvents >>= 
-                                                 W.mapList eventDefinition),
-                                      ("count", fmap W.AnyNode $
-                                                return defnEvents >>= 
-                                                W.lengthList)
-                                    ]))
-                 ]
+appState evts = 
+  do definitionsByWord <- W.filterList isNewDefinition evts >>= W.shuffle eventWord
+     bodies <- W.mapDict (\defnEvents -> W.mapList eventDefinition defnEvents)
+                         definitionsByWord
+     counts <- W.mapDict (\defnEvents -> W.lengthList defnEvents)
+                         definitionsByWord
 
+     W.struct [
+       ("words", fmap W.AnyNode $ 
+                 return evts >>= 
+                 W.filterList isNewWord >>= 
+                 W.mapList eventWord),
+       ("defns", fmap W.AnyNode $
+                 return evts >>=
+                 W.filterList isNewDefinition >>=
+                 W.shuffle eventWord >>=
+                 W.mapDictWithKey (\word _ -> W.struct [
+                            ("bodies", fmap W.AnyNode $
+                                       W.dictLookup word bodies),
+                            ("count", fmap W.AnyNode $
+                                      W.dictLookup word counts)
+                                    ]))]
 
 prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
 prepare input f = evalState (prepare' input f) 0
@@ -70,4 +73,4 @@ main = do let changes = [NewWord "Dog"
           let finalState = foldl (W.applyChange compiled state inputList)
                                  initialState
                                  [W.ListImpulse $ W.AddElement $ W.toData c | c <- (reverse changes)]
-          print $ show finalState
+          putStrLn $ show finalState
