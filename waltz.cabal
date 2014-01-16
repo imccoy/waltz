@@ -15,5 +15,5 @@ Executable waltz
               GADTs,
               ScopedTypeVariables,
               FlexibleInstances
-  build-depends: base, containers, text, safe
-  ghc-options: -Werror -fwarn-unused-imports -fno-cse -fno-full-laziness -auto-all -prof
+  build-depends: base, containers, text, safe, mtl
+  ghc-options: -Werror -fwarn-unused-imports

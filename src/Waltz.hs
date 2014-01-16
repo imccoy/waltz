@@ -3,30 +3,18 @@ module Waltz where
 import Prelude hiding (Integer)
 import qualified Prelude as Prelude
 
-import Data.IORef
+import Control.Monad.State
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Safe
-import System.IO.Unsafe
 
 import qualified Debug.Trace as Trace
 
 debugMode = True
 
 trace = if debugMode then Trace.trace else (\x y -> y)
-
-{-# NOINLINE idRef #-} 
-idRef :: IORef Int
-idRef = unsafePerformIO $ newIORef 0
-
-{-# NOINLINE withRef #-} 
-withRef :: (Int -> b) -> b
-withRef f = f $ unsafePerformIO $ do
-  id <- readIORef idRef
-  writeIORef idRef (id + 1)
-  return id
 
 data Change = Change Context Impulse
   deriving (Show)
@@ -231,7 +219,7 @@ getLandingChanges' compiled@(landingSite, propss, mods) change node
   where props = maybe [] id $ Map.lookup node propss
         mod = fromJustNote ("No modifier for " ++ show node) $ Map.lookup node mods
         changes = mod change
-        landing = if node == landingSite then [change] else []
+        landing = if node == landingSite then changes else []
 
 applyChange compiled stateWatchable nodeWatchable stateValue impulse
   = let landingChanges = getLandingChanges compiled impulse (nodeId nodeWatchable)
@@ -268,52 +256,62 @@ applyImpulse (IntImpulse impulse) (IntegerData value) = IntegerData $ go impulse
   where go (AddInteger m) n = m + n
 applyImpulse impulse value = error $ "Can't apply impulse " ++ show impulse ++ " to " ++ show value
 
-mkWatchable inners = (withRef Node) inners
+type Func = State Int
 
-lengthList :: Datable a => List a -> Integer
-lengthList l = mkWatchable [AnyNode $ mapList (\_ -> (1 :: Prelude.Integer)) l]
-                           SumInteger
+mkWatchable :: forall w. (Watchable w) => [AnyNode] -> w -> Func (Node w)
+mkWatchable inners watchable = do id <- getNextId
+                                  return $ Node id inners watchable
+getNextId :: Func Int
+getNextId = do i <- get
+               let i' = i + 1
+               i' `seq` put i'
+               return i
+
+lengthList :: Datable a => List a -> Func Integer
+lengthList l = do ones <- mapList (\_ -> (1 :: Prelude.Integer)) l
+                  mkWatchable [AnyNode ones] SumInteger
 
 mapList :: forall a b. (Datable a, Datable b)
-        => (a -> b) -> List a -> List b
+        => (a -> b) -> List a -> Func (List b)
 mapList f l = mkWatchable [AnyNode l] (MapList f)
 filterList :: forall a. (Datable a)
-           => (a -> Bool) -> List a -> List a
+           => (a -> Bool) -> List a -> Func (List a)
 filterList f l = mkWatchable [AnyNode l] (FilterList f)
 
 
 shuffle :: forall a k. (Datable a, Datable k)
-        => (a -> k) -> List a -> Dict k (List a)
-shuffle f l = withRef (\n -> Node n [AnyNode l] (ShuffleList n f))
+        => (a -> k) -> List a -> Func (Dict k (List a))
+shuffle f l = do id <- getNextId
+                 return $ Node id [AnyNode l] (ShuffleList id f)
 
 mapDict :: forall k v0 v. (Datable k, Watchable v0, Watchable v)
-        => ((Node v0) -> (Node v)) -> Dict k (Node v0) -> Dict k (Node v)
-mapDict f d = mkWatchable [AnyNode output]
-                          (MapDict context def output)
+        => ((Node v0) -> Func (Node v)) -> Dict k (Node v0) -> Func (Dict k (Node v))
+mapDict f d = do funnelId <- getNextId
+                 let funnel = Tube funnelId [AnyNode d]
+                 output <- f funnel
+                 let def = nodeInitialValue output
+                 mkWatchable [AnyNode output]
+                             (MapDict context def output)
   where 
         context :: Int
         context = dictShuffler (nodeW d)
-        def :: Data
-        def = nodeInitialValue output
-        funnel :: Node v0
-        funnel = (withRef Tube) [AnyNode d]
-        output :: Node v
-        output = f funnel -- TODO confirm application of f to different
-                          --      funnels yields watchables with different
-                          --      ids.
 
 
-inputList :: List a
-inputList = (withRef Tube) []
+inputList :: Func (List a)
+inputList = do id <- getNextId
+               return $ Tube id []
 
-struct :: [(Text, AnyNode)] -> Struct
-struct elemTuples = (withRef structN) elemTuples
-
-structN :: Int -> [(Text, AnyNode)] -> Struct
-structN n elemTuples = let struct = Node n (map AnyNode elems) (Struct elems)
-                           elems = [mkWatchable [w] (StructElem n t)
-                                   |(t,w) <- elemTuples]
-                        in struct
+struct :: [(Text, Func AnyNode)] -> Func Struct
+struct elemTuples = do id <- getNextId
+                       elems <- mapM (elem id)
+                                     elemTuples
+                       return $ Node id (map AnyNode elems) (Struct elems)
+  where elem structId (label, value)
+          = do v <- value
+               elemId <- getNextId
+               return $ Node elemId
+                             [v]
+                             (StructElem structId label)
 
 class PPrint a where
   pprint :: a -> String

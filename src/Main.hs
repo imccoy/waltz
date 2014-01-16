@@ -1,6 +1,6 @@
 import qualified Waltz as W
 import Waltz (Data (..), Datable (..))
-
+import Control.Monad.State
 import Data.Text (Text)
 
 data Event = NewWord Text
@@ -22,34 +22,50 @@ isNewWord _ = False
 isNewDefinition (NewDefinition _ _) = True
 isNewDefinition _ = False
 
-eventWord (NewWord w) = w
-eventWord (NewDefinition w _) = w
+eventWord a = eventWord' a
+eventWord' (NewWord w) = w
+eventWord' (NewDefinition w _) = w
 
 eventDefinition (NewDefinition _ d) = d
 eventDefinition _ = error "no definition"
 
-appState :: W.List Event -> W.Struct
+appState :: W.List Event -> W.Func W.Struct
 appState evts = W.struct [
-                 ("words", W.AnyNode $
-                           ((W.mapList eventWord) . 
-                            (W.filterList isNewWord))
-                            evts),
-                 ("defns", W.AnyNode $
-                           ((W.mapDict (\defnEvents -> W.structN 1000 [
-                              ("bodies", W.AnyNode $ W.mapList eventDefinition defnEvents),
-                              ("count", W.AnyNode $ W.lengthList defnEvents)
-                            ])) .
-                            (W.shuffle eventWord) .
-                            (W.filterList isNewDefinition))
-                            evts)
+                 ("words", fmap W.AnyNode $ 
+                           return evts >>= 
+                           W.filterList isNewWord >>= 
+                           W.mapList eventWord),
+                 ("defns", fmap W.AnyNode $
+                           return evts >>=
+                           W.filterList isNewDefinition >>=
+                           W.shuffle eventWord >>=
+                           W.mapDict (\defnEvents -> W.struct [
+                                      ("bodies", fmap W.AnyNode $
+                                                 return defnEvents >>= 
+                                                 W.mapList eventDefinition),
+                                      ("count", fmap W.AnyNode $
+                                                return defnEvents >>= 
+                                                W.lengthList)
+                                    ]))
                  ]
+
+
+prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
+prepare input f = evalState (prepare' input f) 0
+
+prepare' :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> W.Func ((W.List e),s)
+prepare' input f = do i <- input
+                      s <- f i
+                      return (i,s)
+                     
 
 main = do let changes = [NewWord "Dog"
                         ,NewDefinition "Dog" "Man's best friend"
                         ,NewDefinition "Dog" "A Wolfish Beast"]
-          let inputList = W.inputList :: (W.List Event)
-          let state = appState inputList
+
+          let (inputList, state) = prepare W.inputList appState
           let initialState = W.nodeInitialValue $ state
+          putStrLn $ W.printNode state
           let compiled = W.fullCompile $ W.AnyNode state
           let finalState = foldl (W.applyChange compiled state inputList)
                                  initialState
