@@ -54,12 +54,10 @@ appState evts =
                                     ]))]
 
 prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
-prepare input f = evalState (prepare' input f) 0
-
-prepare' :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> W.Func ((W.List e),s)
-prepare' input f = do i <- input
-                      s <- f i
-                      return (i,s)
+prepare input f = evalState go 0
+  where go = do i <- input
+                s <- f i
+                return (i,s)
                      
 
 main = do let changes = [NewWord "Dog"
