@@ -14,6 +14,7 @@ Executable waltz
               OverloadedStrings,
               GADTs,
               ScopedTypeVariables,
-              FlexibleInstances
+              FlexibleInstances,
+              FlexibleContexts
   build-depends: base, containers, text, safe, mtl
   ghc-options: -Werror -fwarn-unused-imports

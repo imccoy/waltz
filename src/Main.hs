@@ -15,15 +15,17 @@ textA (A t _) = t
 
 appState :: W.List Event -> W.Func W.Struct
 appState evts = 
-  do sumOfAs <- return evts >>=
-                W.shuffle textA >>=
-                W.mapDict (\as -> W.mapList numA as >>=
-                                  W.sumList)
+  do sumOfA <- return evts >>=
+               W.shuffle textA >>=
+               W.mapDict (\as -> W.mapList numA as >>=
+                                 W.sumList)
+     sumOfAAsReplaces <- W.mapDict W.sumToReplace sumOfA
+     sumOfAAsProducts <- W.mapDict W.replaceToProduct sumOfAAsReplaces
      W.struct [
-       ("sum", fmap W.AnyNode $ return sumOfAs),
-       ("summy", fmap W.AnyNode $
-                 W.mapDict W.sumToReplace $
-                 sumOfAs)]
+       ("sum", fmap W.AnyNode $ return sumOfA),
+       ("sumOfAAsReplaces", fmap W.AnyNode $ return sumOfAAsReplaces),
+       ("sumOfAAsProducts", fmap W.AnyNode $ return sumOfAAsProducts),
+       ("productOfSums", fmap W.AnyNode $ W.productList =<< W.dictValues sumOfAAsProducts)]
 
 prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
 prepare input f = evalState go 0

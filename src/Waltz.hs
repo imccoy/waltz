@@ -30,7 +30,9 @@ data ListImpulse = AddElement !Data
   deriving (Show)
 
 data IntImpulse = AddInteger !Prelude.Integer
+                | MultiplyIntegerF !Prelude.Double
   deriving (Show)
+
 
 data Data = ListData ![Data]
           | MapData !Int !Data !(Map.Map Data Data)
@@ -145,7 +147,6 @@ instance (Datable a) => Watchable (ListW a) where
             | f $ fromData elem = [ListImpulse (RemoveElement elem)]
             | otherwise = []
 
-
 type Dict k v = Node (DictW k v)
 data DictW k v = forall elem. (Datable elem) 
                => ShuffleList Int (elem -> k)
@@ -183,7 +184,6 @@ dictShuffler :: DictW k v -> Int
 dictShuffler (ShuffleList id _) = id
 dictShuffler (MapDict id _ _) = id
 
-
 type DictLookup k v = Node (DictLookupW k)
 data DictLookupW k = DictLookup (DictKey k) Int Data
 
@@ -195,20 +195,42 @@ instance Watchable (DictLookupW v) where
             where p = fromJustNote ("DictLookup " ++ show contextId ++ "->" ++ show dictId ++ " stymied") $
                                      Map.lookup dictId cxt
 
+type MSet a = Node (MSetW a)
+data MSetW a = DictValuesMSet Int Data
 
-
+instance Watchable (MSetW a) where
+  initialValue _ _ (DictValuesMSet id d) = MapData id d Map.empty
+  compile (DictValuesMSet _ _) = SimpleCompilation return
 
 
 type Integer = Node IntegerW
-data IntegerW = SumInteger | SumToReplace
+data IntegerW = SumInteger
+              | ProductInteger
+              | SumToReplace 
+              | ReplaceToProduct
 
 instance Watchable IntegerW where
   initialValue id _ (SumInteger) = IntegerData 0
   initialValue id _ (SumToReplace) = IntegerData 0
-  compile (SumInteger) = SimpleCompilation $ \(Change cxt impulse) -> [Change cxt (sumf impulse)]
+  initialValue id _ (ReplaceToProduct) = IntegerData 1
+  initialValue id _ (ProductInteger) = IntegerData 1
+  compile (SumInteger) 
+    = SimpleCompilation $ \(Change cxt impulse) -> 
+                            [Change cxt (sumf impulse)]
     where sumf (ListImpulse (AddElement (IntegerData d))) = IntImpulse $ AddInteger d
-  compile (SumToReplace) = StatefulCompilation $ \(Change cxt impulse) (IntegerData n) -> [Change cxt $ ReplaceImpulse $ replace impulse n]
+  compile (ProductInteger) 
+    = SimpleCompilation return
+  compile (SumToReplace)
+    = StatefulCompilation $ \(Change cxt impulse) (IntegerData n) -> 
+                              [Change cxt $ ReplaceImpulse $ replace impulse n]
     where replace (IntImpulse (AddInteger n')) n = IntegerData $ n' + n
+  compile (ReplaceToProduct)
+    = StatefulCompilation $ \(Change cxt impulse) (IntegerData n) ->
+                              [Change cxt $ prodf impulse n]
+    where prodf (ReplaceImpulse (IntegerData 0)) oldn = ReplaceImpulse $ IntegerData 0
+          prodf (ReplaceImpulse n) 0 = ReplaceImpulse n
+          prodf (ReplaceImpulse (IntegerData n)) oldn
+            = IntImpulse $ MultiplyIntegerF $ fromInteger n / fromInteger oldn
 
 type LandingSite = Int
 type Propagators = Map.Map Int [Int]
@@ -281,25 +303,23 @@ getLandingChanges' compiled@(landingSite, propss, mods, paths) change stateValue
         changes = case mod of 
                     SimpleCompilation f -> f change 
                     StatefulCompilation f -> let mp = Map.lookup node paths
-                                                 p = trace ("mp = " ++ show mp) $ fromJustNote ("No path for " ++ show p) mp
-                                                 v = trace ("p = " ++ show p ++ ", contextFromChange = " ++ show contextFromChange) $ lookupByPath p contextFromChange stateValue
-                                              in trace ("stateful " ++ show v) $ f change v
+                                                 p = fromJustNote ("No path for " ++ show p) mp
+                                                 v = lookupByPath p contextFromChange stateValue
+                                              in f change v
         landing = if node == landingSite then changes else []
 
 lookupByPath [] _ v = v
 lookupByPath ((LookupMap k):p) ctx (MapData id d m)
-  = trace "lookupmap" $ lookupByPath p ctx v
+  = lookupByPath p ctx v
   where ctxElement = fromJustNote ("No " ++ show k ++ 
                                     " in context when doing path lookup") $
                                   Map.lookup k ctx
-        ctxPath = trace ("ctxelement = " ++ show ctxElement) $
-                  case ctxElement of
+        ctxPath = case ctxElement of
                     MapPath v -> v
                     _ -> error "Got structpath when needed mappath"
-        v = trace ("ctxPath = " ++ show ctxPath ++ ", m = " ++ show m) $ 
-            fromJustDef d $ Map.lookup ctxPath m
+        v = fromJustDef d $ Map.lookup ctxPath m
 lookupByPath ((LookupStruct t):p) ctx (StructData _ m)
-  = trace "lookupstruct" $ lookupByPath p ctx v
+  = lookupByPath p ctx v
   where v = fromJustNote ("No " ++ show t ++ 
                           " in context when doing path lookup") $ 
                          Map.lookup t m
@@ -339,6 +359,7 @@ applyImpulse (ListImpulse impulse) (ListData value) = ListData $ go impulse valu
         go (RemoveElement elem) elems = List.delete elem elems
 applyImpulse (IntImpulse impulse) (IntegerData value) = IntegerData $ go impulse value
   where go (AddInteger m) n = m + n
+        go (MultiplyIntegerF m) n = round $ m * (fromInteger n)
 applyImpulse impulse value = error $ "Can't apply impulse " ++ show impulse ++ " to " ++ show value
 
 type Func = State Int
@@ -355,8 +376,14 @@ getNextId = do i <- get
 sumList :: List Prelude.Integer -> Func Integer
 sumList ns = mkWatchable [AnyNode ns] SumInteger
 
+productList :: MSet Integer -> Func Integer
+productList ns = mkWatchable [AnyNode ns] ProductInteger
+
 sumToReplace :: Integer -> Func Integer
 sumToReplace n = mkWatchable [AnyNode n] SumToReplace
+
+replaceToProduct :: Integer -> Func Integer
+replaceToProduct n = mkWatchable [AnyNode n] ReplaceToProduct
 
 lengthList :: Datable a => List a -> Func Integer
 lengthList l = do ones <- mapList (\_ -> (1 :: Prelude.Integer)) l
@@ -369,6 +396,11 @@ filterList :: forall a. (Datable a)
            => (a -> Bool) -> List a -> Func (List a)
 filterList f l = mkWatchable [AnyNode l] (FilterList f)
 
+dictValues :: (Datable k, Watchable v) => Dict k (Node v) -> Func (MSet (Node v))
+dictValues node@(Node _ _ (Just dict))
+  = mkWatchable [AnyNode node] $
+                DictValuesMSet (dictShuffler dict)
+                               (dictMembersDefaultValue dict)
 
 shuffle :: forall a k. (Datable a, Datable k)
         => (a -> k) -> List a -> Func (Dict k (List a))
@@ -402,7 +434,6 @@ dictLookup key map = mkWatchable [AnyNode map]
                                              (dictMembersDefaultValue $ nodeW map))
 
 
-
 inputList :: Func (List a)
 inputList = do id <- getNextId
                return $ Node id [] Nothing
@@ -432,11 +463,15 @@ instance PPrint (ListW a) where
 instance PPrint (DictW k v) where
   pprint (ShuffleList _ _) = "ShuffleList"
   pprint (MapDict _ _ _) = "MapDict"
+instance PPrint (MSetW a) where
+  pprint (DictValuesMSet _ _) = "DictValuesMSet"
 instance PPrint (DictLookupW v) where
   pprint (DictLookup _ _ _) = "DictLookup"
 instance PPrint (IntegerW) where
   pprint (SumInteger) = "SumInteger"
+  pprint (ProductInteger) = "ProductInteger"
   pprint (SumToReplace) = "SumToReplace"
+  pprint (ReplaceToProduct) = "ReplaceToProduct"
 
 printNode :: Watchable a => Node a -> String
 printNode node = show (nodeId node) ++ ":" ++ nodeString ++ 
