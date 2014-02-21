@@ -3,55 +3,27 @@ import Waltz (Data (..), Datable (..))
 import Control.Monad.State
 import Data.Text (Text)
 
-data Event = NewWord Text
-               | NewDefinition Text Text
+data Event = A Text Integer
 
 instance Datable Event where
-  toData (NewWord s) = toData ["NewWord", s]
-  toData (NewDefinition w d) = toData ["NewDefinition", w, d]
-  fromData (ListData ((StringData e):args))
-    | e == "NewWord"       = let [w] = args
-                              in NewWord (fromData w)
-    | e == "NewDefinition" = let [w,d] = args
-                              in NewDefinition (fromData w) (fromData d)
+  toData (A w d) = ListData [toData w, toData d]
+  fromData (ListData [w, d]) = A (fromData w) (fromData d)
   fromData e = error $ "Can't fromData event " ++ show e
 
-isNewWord (NewWord _) = True
-isNewWord _ = False
-
-isNewDefinition (NewDefinition _ _) = True
-isNewDefinition _ = False
-
-eventWord a = eventWord' a
-eventWord' (NewWord w) = w
-eventWord' (NewDefinition w _) = w
-
-eventDefinition (NewDefinition _ d) = d
-eventDefinition _ = error "no definition"
+numA (A _ n) = n
+textA (A t _) = t
 
 appState :: W.List Event -> W.Func W.Struct
 appState evts = 
-  do definitionsByWord <- W.filterList isNewDefinition evts >>= W.shuffle eventWord
-     bodies <- W.mapDict (\defnEvents -> W.mapList eventDefinition defnEvents)
-                         definitionsByWord
-     counts <- W.mapDict (\defnEvents -> W.lengthList defnEvents)
-                         definitionsByWord
-
+  do sumOfAs <- return evts >>=
+                W.shuffle textA >>=
+                W.mapDict (\as -> W.mapList numA as >>=
+                                  W.sumList)
      W.struct [
-       ("words", fmap W.AnyNode $ 
-                 return evts >>= 
-                 W.filterList isNewWord >>= 
-                 W.mapList eventWord),
-       ("defns", fmap W.AnyNode $
-                 return evts >>=
-                 W.filterList isNewDefinition >>=
-                 W.shuffle eventWord >>=
-                 W.mapDictWithKey (\word _ -> W.struct [
-                            ("bodies", fmap W.AnyNode $
-                                       W.dictLookup word bodies),
-                            ("count", fmap W.AnyNode $
-                                      W.dictLookup word counts)
-                                    ]))]
+       ("sum", fmap W.AnyNode $ return sumOfAs),
+       ("summy", fmap W.AnyNode $
+                 W.mapDict W.sumToReplace $
+                 sumOfAs)]
 
 prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
 prepare input f = evalState go 0
@@ -60,9 +32,9 @@ prepare input f = evalState go 0
                 return (i,s)
                      
 
-main = do let changes = [NewWord "Dog"
-                        ,NewDefinition "Dog" "Man's best friend"
-                        ,NewDefinition "Dog" "A Wolfish Beast"]
+main = do let changes = [A "fish" 2
+                        ,A "fish" 4
+                        ,A "cat" 5]
 
           let (inputList, state) = prepare W.inputList appState
           let initialState = W.nodeInitialValue $ state
