@@ -1,6 +1,6 @@
 module Waltz where
 
-import Prelude hiding (Integer)
+import Prelude hiding (Integer, Float)
 import qualified Prelude as Prelude
 
 import Control.Monad.State
@@ -25,6 +25,7 @@ type Context = Map.Map Int PathElement
 
 data Impulse = ListImpulse !ListImpulse
              | IntImpulse !IntImpulse
+             | FloatImpulse !FloatImpulse
              | ReplaceImpulse !Data
              | AddWatcherImpulse !Int !Int !Data !Context
   deriving (Show)
@@ -37,6 +38,9 @@ data IntImpulse = AddInteger !Prelude.Integer
                 | MultiplyIntegerF !Prelude.Double
   deriving (Show)
 
+data FloatImpulse = AddFloat !Prelude.Double
+                  | MultiplyFloat !Prelude.Double
+  deriving (Show)
 
 data Data = ListData ![Data]
           | MapData !Int -- the id of the map
@@ -46,6 +50,7 @@ data Data = ListData ![Data]
                     !(Map.Map Data Data) -- actual data
           | StructData !Int !(Map.Map Text Data)
           | IntegerData !Prelude.Integer
+          | FloatData !Prelude.Double
           | StringData !Text
   deriving (Eq, Ord)
 
@@ -57,6 +62,7 @@ showData (ListData xs) = show xs
 showData (MapData _ _ _ _ m) = show m
 showData (StructData _ m) = show m
 showData (IntegerData i) = show i
+showData (FloatData f) = show f
 showData (StringData t) = show t
 
 class Datable a where
@@ -70,6 +76,10 @@ instance Datable a => Datable [a] where
 instance Datable Prelude.Integer where
   toData i = IntegerData i
   fromData (IntegerData i) = i
+
+instance Datable Prelude.Double where
+  toData f = FloatData f
+  fromData (FloatData f) = f
 
 instance Datable Text where
   toData s = StringData s
@@ -249,12 +259,12 @@ instance Watchable DictSlowLookupPropagatorW where
 type Integer = Node IntegerW
 data IntegerW = SumInteger
               | ProductInteger
-              | SumToReplace 
+              | SumToReplaceInteger
               | ReplaceToProduct
 
 instance Watchable IntegerW where
   initialValue id _ (SumInteger) = IntegerData 0
-  initialValue id _ (SumToReplace) = IntegerData 0
+  initialValue id _ (SumToReplaceInteger) = IntegerData 0
   initialValue id _ (ReplaceToProduct) = IntegerData 1
   initialValue id _ (ProductInteger) = IntegerData 1
   compile (SumInteger) 
@@ -265,7 +275,7 @@ instance Watchable IntegerW where
     = SimpleCompilation $ \(Change cxt impulse) -> case impulse of
                             ReplaceImpulse (IntegerData n) -> [Change cxt (IntImpulse (MultiplyIntegerF (fromIntegral n)))]
                             otherwise -> [Change cxt impulse]
-  compile (SumToReplace)
+  compile (SumToReplaceInteger)
     = StatefulCompilation Nothing $
                           \(Change cxt impulse) (IntegerData n) -> 
                             [Change cxt $ ReplaceImpulse $ replace impulse n]
@@ -278,6 +288,45 @@ instance Watchable IntegerW where
           prodf (ReplaceImpulse n) 0 = ReplaceImpulse n
           prodf (ReplaceImpulse (IntegerData n)) oldn
             = IntImpulse $ MultiplyIntegerF $ fromInteger n / fromInteger oldn
+
+type Float = Node FloatW
+data FloatW = SumFloat
+            | ProductFloat
+            | InvFloat
+            | IntToFloat
+            | SumToReplaceFloat
+
+instance Watchable FloatW where
+  initialValue id _ (SumFloat) = FloatData 0
+  initialValue id _ (SumToReplaceFloat) = FloatData 0
+  initialValue id _ (ProductFloat) = FloatData 1
+  initialValue id _ (InvFloat) = FloatData 1
+  initialValue id [node] (IntToFloat) = case aNodeInitialValue node of
+                                          IntegerData n -> FloatData $ fromIntegral n
+                                          otherwise     -> FloatData 1 --- TODO: fix this
+  compile (SumFloat) 
+    = SimpleCompilation $ \(Change cxt impulse) -> 
+                            [Change cxt (sumf impulse)]
+    where sumf (ListImpulse (AddElement (FloatData d))) = FloatImpulse $ AddFloat d
+  compile (ProductFloat) 
+    = SimpleCompilation $ \(Change cxt impulse) -> case impulse of
+                            ReplaceImpulse (FloatData n) -> [Change cxt (FloatImpulse (MultiplyFloat n))]
+                            otherwise -> [Change cxt impulse]
+  compile (InvFloat)
+    = SimpleCompilation $ \(Change cxt impulse) -> 
+                            [Change cxt (invf impulse)]
+    where invf (FloatImpulse (MultiplyFloat f)) = FloatImpulse $ MultiplyFloat (1 / f)
+  compile (IntToFloat)
+    = SimpleCompilation $ \(Change cxt impulse) ->
+                            [Change cxt (toFf impulse)]
+    where toFf (IntImpulse (MultiplyIntegerF f)) = FloatImpulse $ MultiplyFloat f
+          toFf (IntImpulse (AddInteger f)) = FloatImpulse $ AddFloat $ fromInteger f
+  compile (SumToReplaceFloat)
+    = StatefulCompilation Nothing $
+                          \(Change cxt impulse) (FloatData n) -> 
+                            [Change cxt $ ReplaceImpulse $ replace impulse n]
+    where replace (FloatImpulse (AddFloat n')) n = FloatData $ n' + n
+
 
 type LandingSite = Int
 type Propagators = Map.Map Int [Int]
@@ -457,6 +506,9 @@ applyImpulse (ListImpulse impulse) (ListData value) = ListData $ go impulse valu
 applyImpulse (IntImpulse impulse) (IntegerData value) = IntegerData $ go impulse value
   where go (AddInteger m) n = m + n
         go (MultiplyIntegerF m) n = round $ m * (fromInteger n)
+applyImpulse (FloatImpulse impulse) (FloatData value) = FloatData $ go impulse value
+  where go (AddFloat m) n = m + n
+        go (MultiplyFloat m) n = m * n
 applyImpulse (AddWatcherImpulse nodeToWatch watchId key context) (MapData id shufflerId def watchers map)
   = MapData id shufflerId def newWatchers map
   where newWatchers = Map.alter go key watchers
@@ -476,17 +528,31 @@ getNextId = do i <- get
                i' `seq` put i'
                return i
 
+-- precondition: ns only receive add changes
 sumList :: List Prelude.Integer -> Func Integer
 sumList ns = mkWatchable [AnyNode ns] SumInteger
 
+-- precondition: ns only receive multiply changes
 productMSet :: MSet Integer -> Func Integer
 productMSet ns = mkWatchable [AnyNode ns] ProductInteger
 
 sumToReplace :: Integer -> Func Integer
-sumToReplace n = mkWatchable [AnyNode n] SumToReplace
+sumToReplace n = mkWatchable [AnyNode n] SumToReplaceInteger
 
 replaceToProduct :: Integer -> Func Integer
 replaceToProduct n = mkWatchable [AnyNode n] ReplaceToProduct
+
+intToFloat :: Integer -> Func Float
+intToFloat n = mkWatchable [AnyNode n] IntToFloat
+
+-- precondition: n only receives multiply changes
+invFloat :: Float -> Func Float
+invFloat n = mkWatchable [AnyNode n] InvFloat
+
+-- precondition: b only receives multiply changes
+divide :: Float -> Float -> Func Float
+divide a b = do b' <- invFloat b
+                mkWatchable [AnyNode a, AnyNode b'] ProductFloat
 
 lengthList :: Datable a => List a -> Func Integer
 lengthList l = do ones <- mapList (\_ -> (1 :: Prelude.Integer)) l
@@ -600,8 +666,13 @@ instance PPrint (DictSlowLookupPropagatorW) where
 instance PPrint (IntegerW) where
   pprint (SumInteger) = "SumInteger"
   pprint (ProductInteger) = "ProductInteger"
-  pprint (SumToReplace) = "SumToReplace"
+  pprint (SumToReplaceInteger) = "SumToReplaceInteger"
   pprint (ReplaceToProduct) = "ReplaceToProduct"
+instance PPrint (FloatW) where
+  pprint (SumFloat) = "SumFloat"
+  pprint (ProductFloat) = "ProductFloat"
+  pprint (InvFloat) = "InvFloat"
+  pprint (IntToFloat) = "IntToFloat"
 
 printNode :: Watchable a => Node a -> String
 printNode node = show (nodeId node) ++ ":" ++ nodeString ++ 

@@ -38,12 +38,27 @@ appState evts =
                         W.dictValues >>=
                         W.productMSet)
                       shuffledBs
+     bsAsFloat <- W.mapDict W.intToFloat bs
+     bsLengths <- W.mapDict (\bs -> W.lengthList bs)
+                            shuffledBs
+     bsLengthsAsReplaces <- W.mapDict W.sumToReplace bsLengths
+     bsLengthsAsProducts <- W.mapDict W.replaceToProduct bsLengthsAsReplaces
+     bsLengthsAsFloat <- W.mapDict W.intToFloat bsLengthsAsProducts
      W.struct [
        ("sum", fmap W.AnyNode $ return sumOfA),
        ("sumOfAAsReplaces", fmap W.AnyNode $ return sumOfAAsReplaces),
        ("sumOfAAsProducts", fmap W.AnyNode $ return sumOfAAsProducts),
        ("productOfSums", fmap W.AnyNode $ W.productMSet =<< W.dictValues sumOfAAsProducts),
-       ("bs", fmap W.AnyNode $ return bs)]
+       ("bs", fmap W.AnyNode $ return bs),
+       ("bsLengths", fmap W.AnyNode $ return bsLengths),
+       ("bsLengthsAsReplaces", fmap W.AnyNode $ return bsLengthsAsReplaces),
+       ("bsLengthsAsProducts", fmap W.AnyNode $ return bsLengthsAsProducts),
+       ("bsLengthsAsFloat", fmap W.AnyNode $ return bsLengthsAsFloat),
+       ("quotients", fmap W.AnyNode $ W.mapDictWithKey (\k bsLength -> do
+                                                          bs' <- W.dictLookup k bsAsFloat
+                                                          W.divide bs' bsLength
+                                                       )
+                                                       bsLengthsAsFloat)]
 
 prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
 prepare input f = evalState go 0
