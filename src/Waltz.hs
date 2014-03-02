@@ -119,8 +119,8 @@ nodeInners (Node _ inners _) = inners
 nodeW (Node _ _ (Just a)) = a
 
 nodeInitialValue :: Watchable a => Node a -> Data
-nodeInitialValue (Node id inners (Just w)) = initialValue id inners w
-nodeInitialValue (Node id [inner] Nothing) = aNodeInitialValue inner
+nodeInitialValue (Node id inners (Just w)) = trace ("nodeinitialvalue here at " ++ show id) $ initialValue id inners w
+nodeInitialValue (Node id (inner:_) Nothing) = trace ("nodeinitialvalue at " ++ show id ++ " -> " ++ show (aNodeId inner)) aNodeInitialValue inner
 
 nodeCompile (Node _ _ Nothing) = SimpleCompilation $ return
 nodeCompile (Node _ _ (Just w)) = compile w
@@ -173,7 +173,7 @@ data DictW k v = forall elem. (Datable elem)
                => ShuffleList Int (elem -> k)
                | forall v'. (v ~ Node v', Watchable v')
                => MapDict Int        -- id of the Dict that gives us our context
-                          Data       -- default value in result
+                          (Node v')  -- default value in result
                           (Node v')  -- actual result value, constructed by
                                      --  applying the map function to a tube being
                                      --  filled by the dict being mapped over
@@ -185,7 +185,7 @@ data DictSlowKey k = forall k0 v. (Datable k0, Datable k, Watchable v) => DictSl
 instance (Datable k, Watchable v) => Watchable (DictW k (Node v)) where
   initialValue id inners map = MapData id
                                        inner
-                                       (dictMembersDefaultValue map)
+                                       (nodeInitialValue $ dictMembersDefaultValue map)
                                        Map.empty
                                        Map.empty
     where
@@ -201,7 +201,8 @@ instance (Datable k, Watchable v) => Watchable (DictW k (Node v)) where
   watchablePaths mapId (ShuffleList id _) = [(LookupMap mapId id, Nothing)]
   watchablePaths mapId (MapDict id _ v) = [(LookupMap mapId id, Just $ AnyNode v)]
 
-dictMembersDefaultValue (ShuffleList _ _) = ListData []
+dictMembersDefaultValue :: (Watchable v) => DictW k (Node v) -> (Node v)
+dictMembersDefaultValue (ShuffleList _ _) = (Node (-1) [] Nothing)
 dictMembersDefaultValue (MapDict _ d _) = d
 
 dictShuffler :: DictW k v -> Int
@@ -221,10 +222,10 @@ instance Watchable (DictLookupW v) where
                   contextId = dictShuffler $ nodeW context
 
 type MSet a = Node (MSetW a)
-data MSetW a = DictValuesMSet Int Data
+data MSetW a = forall a'. (a ~ Node a', Watchable a') => DictValuesMSet Int (Node a')
 
 instance Watchable (MSetW a) where
-  initialValue id _ (DictValuesMSet shufflerId d) = MapData id shufflerId d Map.empty Map.empty
+  initialValue id _ (DictValuesMSet shufflerId d) = MapData id shufflerId (nodeInitialValue d) Map.empty Map.empty
   compile (DictValuesMSet _ _) = SimpleCompilation return
 
 
@@ -265,7 +266,7 @@ data IntegerW = SumInteger
 instance Watchable IntegerW where
   initialValue id _ (SumInteger) = IntegerData 0
   initialValue id _ (SumToReplaceInteger) = IntegerData 0
-  initialValue id _ (ReplaceToProduct) = IntegerData 1
+  initialValue id _ (ReplaceToProduct) = trace "INITIAL" $ IntegerData 1
   initialValue id _ (ProductInteger) = IntegerData 1
   compile (SumInteger) 
     = SimpleCompilation $ \(Change cxt impulse) -> 
@@ -303,7 +304,7 @@ instance Watchable FloatW where
   initialValue id _ (InvFloat) = FloatData 1
   initialValue id [node] (IntToFloat) = case aNodeInitialValue node of
                                           IntegerData n -> FloatData $ fromIntegral n
-                                          otherwise     -> FloatData 1 --- TODO: fix this
+                                          err     -> error $ "No initialValue IntToFloat " ++ show err
   compile (SumFloat) 
     = SimpleCompilation $ \(Change cxt impulse) -> 
                             [Change cxt (sumf impulse)]
@@ -585,7 +586,7 @@ mapDictWithKey :: forall k v0 v. (Datable k, Watchable v0, Watchable v)
 mapDictWithKey f d = do funnelId <- getNextId
                         let funnel = Node funnelId [AnyNode d] Nothing
                         output <- f (DictKey d) funnel
-                        let def = nodeInitialValue output
+                        def <- f (DictKey d) (dictMembersDefaultValue $ nodeW d)
                         result <- mkWatchable [AnyNode output]
                                               (MapDict context def output)
                         return result
@@ -601,7 +602,7 @@ dictLookup key map
   = do lookup <- mkWatchable [AnyNode map] 
                              (DictLookup key
                                          (dictShuffler $ nodeW map)
-                                         (dictMembersDefaultValue $ nodeW map))
+                                         (nodeInitialValue $ dictMembersDefaultValue $ nodeW map))
        id <- getNextId
        return $ Node id [AnyNode lookup] Nothing
 
@@ -614,7 +615,7 @@ dictSlowLookup key@(DictSlowKey context f) map
                             (DictSlowLookup key
                                             (nodeId map)
                                             (dictShuffler $ nodeW map)
-                                            (dictMembersDefaultValue $ nodeW map))
+                                            (nodeInitialValue $ dictMembersDefaultValue $ nodeW map))
       escaper <- mkWatchable [AnyNode map]
                              (DictSlowLookupPropagator (nodeId map))
       id <- getNextId

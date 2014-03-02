@@ -69,11 +69,11 @@ prepare input f = evalState go 0
 
 main = do let changes = [A "fish" 2
                         ,A "fish" 4
-                        ,B "feline" "cat"
-                        ,B "feline" "tiger"
                         ,A "cat" 5
                         ,A "tiger" 3
                         ,A "tiger" 1
+                        ,B "feline" "cat"
+                        ,B "feline" "tiger"
                         ]
 
           let (inputList, state) = prepare W.inputList appState
