@@ -15,6 +15,7 @@ Executable waltz
               GADTs,
               ScopedTypeVariables,
               FlexibleInstances,
-              FlexibleContexts
+              FlexibleContexts,
+              TupleSections
   build-depends: base, containers, text, safe, mtl
   ghc-options: -Werror -fwarn-unused-imports

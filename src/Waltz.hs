@@ -4,6 +4,8 @@ import Prelude hiding (Integer, Float)
 import qualified Prelude as Prelude
 
 import Control.Monad.State
+import qualified Data.Function
+import qualified Data.Graph as Graph
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -36,6 +38,7 @@ data ListImpulse = AddElement !Data
 
 data IntImpulse = AddInteger !Prelude.Integer
                 | MultiplyIntegerF !Prelude.Double
+                | MultiplyInteger !Prelude.Integer
   deriving (Show)
 
 data FloatImpulse = AddFloat !Prelude.Double
@@ -45,7 +48,7 @@ data FloatImpulse = AddFloat !Prelude.Double
 data Data = ListData ![Data]
           | MapData !Int -- the id of the map
                     !Int -- the id of the relevant shuffler
-                    !Data -- default value
+                    !DefaultNode -- default value
                     !(Map.Map Data (Set.Set (Int, Context))) -- watchers
                     !(Map.Map Data Data) -- actual data
           | StructData !Int !(Map.Map Text Data)
@@ -53,6 +56,13 @@ data Data = ListData ![Data]
           | FloatData !Prelude.Double
           | StringData !Text
   deriving (Eq, Ord)
+
+data DefaultNode = forall v. Watchable v => DefaultNode (Node v)
+instance Eq DefaultNode where
+  (DefaultNode (Node a _ _)) == (DefaultNode (Node b _ _)) = a == b
+instance Ord DefaultNode where
+  (DefaultNode (Node a _ _)) `compare` (DefaultNode (Node b _ _)) = a `compare` b
+defaultValue (DefaultNode node) = nodeInitialValue node
 
 instance Show Data where
   show x = showData x
@@ -99,10 +109,13 @@ data PathElement = StructPath Text | MapPath Data
 
 data Compiled = SimpleCompilation (Change -> [Change])
               | StatefulCompilation (Maybe Int) (Change -> Data -> [Change])
+              | PartiallyTargetedCompilation (Maybe Int) (Change -> Data -> ([Change],[(Int,Change)]))
               | TargetedCompilation (Maybe Int) (Change -> Data -> [(Int, Change)])
 
 class PPrint a => Watchable a where
-  initialValue :: Int -> [AnyNode] -> a -> Data
+  initialValue' :: Int -> [AnyNode] -> a -> Data
+  initialValue :: Int -> [AnyNode] -> Context -> a -> (Data, [(Int, Change)])
+  initialValue id inners cxt node = (initialValue' id inners node, [])
   compile :: a -> Compiled
   watchablePaths :: Int -> a -> [(Lookup, Maybe AnyNode)]
   watchablePaths _ _ = []
@@ -118,9 +131,9 @@ nodeId (Node id _ _) = id
 nodeInners (Node _ inners _) = inners
 nodeW (Node _ _ (Just a)) = a
 
-nodeInitialValue :: Watchable a => Node a -> Data
-nodeInitialValue (Node id inners (Just w)) = trace ("nodeinitialvalue here at " ++ show id) $ initialValue id inners w
-nodeInitialValue (Node id (inner:_) Nothing) = trace ("nodeinitialvalue at " ++ show id ++ " -> " ++ show (aNodeId inner)) aNodeInitialValue inner
+nodeInitialValue :: Watchable a => Node a -> Context -> (Data, [(Int, Change)])
+nodeInitialValue (Node id inners (Just w)) cxt = trace ("nodeinitialvalue here at " ++ show id) $ initialValue id inners cxt w
+nodeInitialValue (Node id (inner:_) Nothing) cxt = trace ("nodeinitialvalue at " ++ show id ++ " -> " ++ show (aNodeId inner)) $ aNodeInitialValue inner cxt
 
 nodeCompile (Node _ _ Nothing) = SimpleCompilation $ return
 nodeCompile (Node _ _ (Just w)) = compile w
@@ -128,15 +141,25 @@ nodeCompile (Node _ _ (Just w)) = compile w
 
 aNodeId (AnyNode w) = nodeId w
 aNodeInners (AnyNode w) = nodeInners w
-aNodeInitialValue (AnyNode w) = nodeInitialValue w
+aNodeInitialValue :: AnyNode -> Context -> (Data, [(Int, Change)])
+aNodeInitialValue (AnyNode w) cxt = nodeInitialValue w cxt
+
+type Const k = Node (ConstW k)
+data ConstW k = (Datable k) => Const k
+instance Watchable (ConstW k) where
+  initialValue' id _ (Const k) = toData k
+  compile (Const _) = SimpleCompilation $ error "Const is confused"
 
 type Struct = Node StructW
 data StructW = Struct [StructElem]
 instance Watchable StructW where
-  initialValue id _ (Struct elems) = StructData id $ foldr addElem Map.empty elems
-    where addElem :: StructElem -> (Map.Map Text Data) -> (Map.Map Text Data)
-          addElem elem@(Node _ _ (Just (StructElem _ key _))) map
-             = Map.insert key (nodeInitialValue elem) map
+  initialValue' _ _ _ = error "should always go to initialValue, not initialValue'"
+  initialValue id _ cxt (Struct elems) = (StructData id val, watchers)
+    where addElem :: StructElem -> (Map.Map Text Data, [(Int,Change)]) -> (Map.Map Text Data, [(Int,Change)])
+          addElem elem@(Node _ _ (Just (StructElem _ key _))) (map, ws)
+             = let (v, w) = nodeInitialValue elem cxt
+                in (Map.insert key v map, w ++ ws)
+          (val, watchers) = foldr addElem (Map.empty, []) elems
   compile (Struct _) = SimpleCompilation return
   watchablePaths structId (Struct elems) = concatMap (watchablePaths structId . nodeW) elems
 
@@ -144,7 +167,8 @@ type StructElem = Node StructElemW
 data StructElemW = StructElem Int Text AnyNode
 
 instance Watchable StructElemW where
-  initialValue _ [w] (StructElem _ _ _) = aNodeInitialValue w
+  initialValue' _ _ _ = error "should always go to initialValue, not initialValue'"
+  initialValue _ [w] cxt (StructElem _ _ _) = aNodeInitialValue w cxt
   compile (StructElem structId label _) = SimpleCompilation $
                                             addToChangeContext structId
                                                                (StructPath label)
@@ -155,7 +179,7 @@ data ListW a = forall b. (Datable b) => MapList (b -> a)
              | FilterList (a -> Bool)
 
 instance (Datable a) => Watchable (ListW a) where
-  initialValue _ _ _ = ListData []
+  initialValue' _ _ _ = ListData []
 
   compile (MapList f) = SimpleCompilation $ \(Change cxt impulse) -> [Change cxt (mapf f impulse)]
     where mapf f (ListImpulse (AddElement elem)) = ListImpulse (AddElement (toData $ f $ fromData elem))
@@ -173,47 +197,50 @@ data DictW k v = forall elem. (Datable elem)
                => ShuffleList Int (elem -> k)
                | forall v'. (v ~ Node v', Watchable v')
                => MapDict Int        -- id of the Dict that gives us our context
-                          (Node v')  -- default value in result
                           (Node v')  -- actual result value, constructed by
                                      --  applying the map function to a tube being
                                      --  filled by the dict being mapped over
 
-data DictKey k = forall v. (Datable k, Watchable v) => DictKey (Dict k (Node v))  -- map whose key we're looking up
+data DictKey k = forall v. (Datable k, Watchable v) =>
+                 DictKey (Dict k (Node v))  -- map whose key we're looking up
 
-data DictSlowKey k = forall k0 v. (Datable k0, Datable k, Watchable v) => DictSlowKey (Dict k0 (Node v)) (k0 -> k)
+data DictSlowKey k = forall k0 v. (Datable k0, Datable k, Watchable v) =>
+                     DictSlowKey (Dict k0 (Node v)) (k0 -> k)
 
 instance (Datable k, Watchable v) => Watchable (DictW k (Node v)) where
-  initialValue id inners map = MapData id
-                                       inner
-                                       (nodeInitialValue $ dictMembersDefaultValue map)
-                                       Map.empty
-                                       Map.empty
+  initialValue' id inners map = MapData id
+                                        inner
+                                        (DefaultNode $ dictMembersDefaultValue map)
+                                        Map.empty
+                                        Map.empty
     where
       inner = dictShuffler map
   
   compile (ShuffleList id f) = SimpleCompilation $ 
     \c@(Change cxt impulse) -> 
       addToChangeContext id (MapPath $ shufflef f impulse) c
-    where shufflef f (ListImpulse (AddElement elem)) = trace ("shuffling " ++ show id ++  " " ++ show elem ++ " to " ++ show (toData $ f $ fromData elem)) $ toData $ f $ fromData elem
+    where shufflef f (ListImpulse (AddElement elem)) = trace ("shuffling " ++ show id ++  " " ++ show elem ++ " to " ++ show (toData $ f $ fromData elem)) $ 
+                                                       toData $ f $ fromData elem
           shufflef f (ListImpulse (RemoveElement elem)) = toData $ f $ fromData elem
 
-  compile (MapDict _ _ v) = SimpleCompilation $ return
+  compile (MapDict _ v) = SimpleCompilation $ return
   watchablePaths mapId (ShuffleList id _) = [(LookupMap mapId id, Nothing)]
-  watchablePaths mapId (MapDict id _ v) = [(LookupMap mapId id, Just $ AnyNode v)]
+  watchablePaths mapId (MapDict id v) = [(LookupMap mapId id, Just $ AnyNode v)]
 
 dictMembersDefaultValue :: (Watchable v) => DictW k (Node v) -> (Node v)
 dictMembersDefaultValue (ShuffleList _ _) = (Node (-1) [] Nothing)
-dictMembersDefaultValue (MapDict _ d _) = d
+dictMembersDefaultValue (MapDict _ d) = d
 
 dictShuffler :: DictW k v -> Int
 dictShuffler (ShuffleList id _) = id
-dictShuffler (MapDict id _ _) = id
+dictShuffler (MapDict id _) = id
 
 type DictLookup k v = Node (DictLookupW k)
-data DictLookupW k = DictLookup (DictKey k) Int Data
+data DictLookupW k = DictLookup (DictKey k) Int DefaultNode
 
 instance Watchable (DictLookupW v) where
-  initialValue _ _ (DictLookup (DictKey _) _ def) = def
+  initialValue' _ _ _ = error "should always go to initialValue, not initialValue'"
+  initialValue _ _ cxt (DictLookup (DictKey _) _ def) = defaultValue def cxt
   compile (DictLookup (DictKey context) dictId _) = SimpleCompilation go
     where go change@(Change cxt _) = trace ("DictLookup " ++ show contextId ++ " -> " ++ show dictId) $
                                      addToChangeContext contextId p change
@@ -221,67 +248,104 @@ instance Watchable (DictLookupW v) where
                                      Map.lookup dictId cxt
                   contextId = dictShuffler $ nodeW context
 
+
+type StructLookup v = Node (StructLookupW)
+data StructLookupW = StructLookup Text Struct
+
+instance Watchable (StructLookupW) where
+  initialValue' _ _ _ = error "should always go to initialValue, not initialValue'"
+  initialValue _ _ cxt (StructLookup key struct) = let (StructData _ d, changes) = nodeInitialValue struct cxt
+                                                    in (fromJustNote ("no default valuue for key " ++ show key ++ " in " ++ show d) $
+                                                                     Map.lookup key d,
+                                                       changes)
+  compile (StructLookup key struct) = SimpleCompilation go
+    where go change@(Change cxt _)
+            | p == (StructPath key)  = [change]
+            | otherwise              = []
+            where p = fromJustNote ("StructLookup " ++ show (nodeId struct) ++ " stymied") $
+                                     Map.lookup (nodeId struct) cxt
+
+
+
 type MSet a = Node (MSetW a)
-data MSetW a = forall a'. (a ~ Node a', Watchable a') => DictValuesMSet Int (Node a')
+data MSetW a = forall a'. (a ~ Node a', Watchable a') =>
+               DictValuesMSet Int (Node a')
 
 instance Watchable (MSetW a) where
-  initialValue id _ (DictValuesMSet shufflerId d) = MapData id shufflerId (nodeInitialValue d) Map.empty Map.empty
+  initialValue' id _ (DictValuesMSet shufflerId d) = MapData id
+                                                            shufflerId
+                                                            (DefaultNode d)
+                                                            Map.empty
+                                                            Map.empty
   compile (DictValuesMSet _ _) = SimpleCompilation return
 
 
 type DictSlowLookup k = Node (DictSlowLookupW k)
-data DictSlowLookupW k = DictSlowLookup (DictSlowKey k) Int Int Data
+data DictSlowLookupW k = DictSlowLookup (DictSlowKey k) Int Int DefaultNode
 
 instance Watchable (DictSlowLookupW v) where
-  initialValue _ _ (DictSlowLookup (DictSlowKey _ _) _ _ def) = def
-  compile (DictSlowLookup (DictSlowKey context f) dictId shufflerId _)
-    = StatefulCompilation (Just dictId) $ \(Change cxt _) (MapData _ _ def _ map) ->
-        let contextId = dictShuffler $ nodeW context
-            inKeyElt = fromJustNote ("DictSlowLookup " ++ show contextId ++ "->" ++ show (dictId, shufflerId) ++ " styimed in " ++ show cxt) $
-                                    Map.lookup contextId cxt
-            (MapPath inKey) = inKeyElt
-            outKey = toData $ f $ fromData inKey
-            value = fromJustDef def $ Map.lookup outKey map
-         in [Change cxt (ReplaceImpulse value),
-             AddWatcher dictId outKey cxt]
+  initialValue' _ _ _ = error "should always go to initialValue, not initialValue'"
+  initialValue id _ cxt (DictSlowLookup key dictId _ def)
+    = let (v, changes) = defaultValue def cxt
+       in (v, (id, AddWatcher dictId (dictSlowLookupOutKey key cxt) cxt):changes)
+
+  compile (DictSlowLookup key dictId shufflerId _)
+    = PartiallyTargetedCompilation (Just dictId) $ \(Change cxt _) (MapData _ _ def _ map) ->
+        let outKey = dictSlowLookupOutKey key cxt
+            maybeValue = Map.lookup outKey map
+            maybeValueWithChanges = fmap (,[]) maybeValue
+            (value, changes) = fromJustDef (defaultValue def cxt) maybeValueWithChanges
+         in ([Change cxt (ReplaceImpulse value),
+              AddWatcher dictId outKey cxt],
+             changes)
+dictSlowLookupOutKey (DictSlowKey context f) cxt = toData $ f $ fromData inKey
+  where contextId = dictShuffler $ nodeW context
+        (MapPath inKey) = fromJustNote ("DictSlowLookup " ++ show contextId ++ " styimed in " ++ show cxt) $
+                                       Map.lookup contextId cxt
+
 
 type DictSlowLookupPropagator = Node DictSlowLookupPropagatorW
 data DictSlowLookupPropagatorW = DictSlowLookupPropagator Int
 
 instance Watchable DictSlowLookupPropagatorW where
-  initialValue _ _ _ = error "DictSlowLookupPropagator initialValue"
+  initialValue' _ _ _ = error "DictSlowLookupPropagator initialValue"
   compile (DictSlowLookupPropagator dictId)
     = TargetedCompilation (Just dictId) $ \(Change cxt impulse) (MapData _ shufflerId _ watcherMap _) ->
       let (MapPath shuffleKey) = fromJustNote ("DictSlowLookupPropagator failed lookup") $
                                               Map.lookup shufflerId cxt
           watchers = fromJustDef Set.empty $ Map.lookup shuffleKey watcherMap
-       in [(i,(Change (Map.union c cxt) impulse)) | (i,c) <- Set.toList watchers]
+       in [trace ("DictSlowLookupPropagator " ++ show dictId ++ " going to " ++ show i) $
+           (i,(Change (Map.union c cxt) impulse)) | (i,c) <- Set.toList watchers]
 
 type Integer = Node IntegerW
 data IntegerW = SumInteger
               | ProductInteger
-              | SumToReplaceInteger
-              | ReplaceToProduct
+              | ToReplaceInteger
+              | IntegerReplaceToProduct
+              | IntegerReplaceToSum
 
 instance Watchable IntegerW where
-  initialValue id _ (SumInteger) = IntegerData 0
-  initialValue id _ (SumToReplaceInteger) = IntegerData 0
-  initialValue id _ (ReplaceToProduct) = trace "INITIAL" $ IntegerData 1
-  initialValue id _ (ProductInteger) = IntegerData 1
+  initialValue' id _ (SumInteger) = IntegerData 0
+  initialValue' id _ (ToReplaceInteger) = IntegerData 0
+  initialValue' id _ (IntegerReplaceToProduct) = IntegerData 1
+  initialValue' id _ (IntegerReplaceToSum) = IntegerData 0
+  initialValue' id _ (ProductInteger) = IntegerData 1
   compile (SumInteger) 
     = SimpleCompilation $ \(Change cxt impulse) -> 
                             [Change cxt (sumf impulse)]
     where sumf (ListImpulse (AddElement (IntegerData d))) = IntImpulse $ AddInteger d
+          sumf (ReplaceImpulse (IntegerData n)) = IntImpulse (AddInteger n) 
   compile (ProductInteger) 
     = SimpleCompilation $ \(Change cxt impulse) -> case impulse of
-                            ReplaceImpulse (IntegerData n) -> [Change cxt (IntImpulse (MultiplyIntegerF (fromIntegral n)))]
+                            ReplaceImpulse (IntegerData n) -> [Change cxt (IntImpulse (MultiplyInteger n))]
                             otherwise -> [Change cxt impulse]
-  compile (SumToReplaceInteger)
+  compile (ToReplaceInteger)
     = StatefulCompilation Nothing $
                           \(Change cxt impulse) (IntegerData n) -> 
                             [Change cxt $ ReplaceImpulse $ replace impulse n]
     where replace (IntImpulse (AddInteger n')) n = IntegerData $ n' + n
-  compile (ReplaceToProduct)
+          replace (IntImpulse (MultiplyInteger n')) n = IntegerData $ n' * n
+  compile (IntegerReplaceToProduct)
     = StatefulCompilation Nothing $
                           \(Change cxt impulse) (IntegerData n) ->
                             [Change cxt $ prodf impulse n]
@@ -289,26 +353,44 @@ instance Watchable IntegerW where
           prodf (ReplaceImpulse n) 0 = ReplaceImpulse n
           prodf (ReplaceImpulse (IntegerData n)) oldn
             = IntImpulse $ MultiplyIntegerF $ fromInteger n / fromInteger oldn
+  compile (IntegerReplaceToSum)
+    = StatefulCompilation Nothing $
+                          \(Change cxt impulse) (IntegerData n) ->
+                            [Change cxt $ prodf impulse n]
+    where prodf (ReplaceImpulse (IntegerData 1)) oldn = ReplaceImpulse $ IntegerData 0
+          prodf (ReplaceImpulse n) 1 = ReplaceImpulse n
+          prodf (ReplaceImpulse (IntegerData n)) oldn
+            = IntImpulse $ AddInteger $ fromInteger n - fromInteger oldn
+
+
 
 type Float = Node FloatW
 data FloatW = SumFloat
             | ProductFloat
             | InvFloat
             | IntToFloat
-            | SumToReplaceFloat
+            | FloatReplaceToSum
+            | FloatReplaceToProduct
+            | ToReplaceFloat
 
 instance Watchable FloatW where
-  initialValue id _ (SumFloat) = FloatData 0
-  initialValue id _ (SumToReplaceFloat) = FloatData 0
-  initialValue id _ (ProductFloat) = FloatData 1
-  initialValue id _ (InvFloat) = FloatData 1
-  initialValue id [node] (IntToFloat) = case aNodeInitialValue node of
-                                          IntegerData n -> FloatData $ fromIntegral n
-                                          err     -> error $ "No initialValue IntToFloat " ++ show err
+  initialValue' _ _ _ = error "should always go to initialValue, not initialValue'"
+  initialValue id _ _ (SumFloat) = (FloatData 0,[])
+  initialValue id _ _ (ToReplaceFloat) = (FloatData 0,[])
+  initialValue id _ _ (ProductFloat) = (FloatData 1,[])
+  initialValue id _ _ (FloatReplaceToSum) = (FloatData 0,[])
+  initialValue id _ _ (FloatReplaceToProduct) = (FloatData 1,[])
+  initialValue id _ _ (InvFloat) = (FloatData 1,[])
+  initialValue id [node] cxt (IntToFloat)
+    = case aNodeInitialValue node cxt of
+        (IntegerData n, changes) -> (FloatData $ fromIntegral n, changes)
+        err                      -> error $ "No initialValue IntToFloat " ++ show err
   compile (SumFloat) 
     = SimpleCompilation $ \(Change cxt impulse) -> 
                             [Change cxt (sumf impulse)]
     where sumf (ListImpulse (AddElement (FloatData d))) = FloatImpulse $ AddFloat d
+          sumf (ReplaceImpulse (FloatData d)) = FloatImpulse (AddFloat d)
+          sumf (FloatImpulse (AddFloat n)) = FloatImpulse (AddFloat n)
   compile (ProductFloat) 
     = SimpleCompilation $ \(Change cxt impulse) -> case impulse of
                             ReplaceImpulse (FloatData n) -> [Change cxt (FloatImpulse (MultiplyFloat n))]
@@ -317,28 +399,53 @@ instance Watchable FloatW where
     = SimpleCompilation $ \(Change cxt impulse) -> 
                             [Change cxt (invf impulse)]
     where invf (FloatImpulse (MultiplyFloat f)) = FloatImpulse $ MultiplyFloat (1 / f)
+          invf (ReplaceImpulse (FloatData n)) = ReplaceImpulse $ FloatData (1 / n)
+          invf imp = error $ "can't InvFloat " ++ show imp
   compile (IntToFloat)
     = SimpleCompilation $ \(Change cxt impulse) ->
                             [Change cxt (toFf impulse)]
-    where toFf (IntImpulse (MultiplyIntegerF f)) = FloatImpulse $ MultiplyFloat f
-          toFf (IntImpulse (AddInteger f)) = FloatImpulse $ AddFloat $ fromInteger f
-  compile (SumToReplaceFloat)
+    where toFf (IntImpulse (MultiplyIntegerF n)) = FloatImpulse $ MultiplyFloat n
+          toFf (IntImpulse (MultiplyInteger n)) = FloatImpulse $ MultiplyFloat $ fromInteger n
+          toFf (IntImpulse (AddInteger n)) = FloatImpulse $ AddFloat $ fromInteger n
+          toFf (ReplaceImpulse (IntegerData n)) = ReplaceImpulse $ FloatData $ fromInteger n
+  compile (ToReplaceFloat)
     = StatefulCompilation Nothing $
                           \(Change cxt impulse) (FloatData n) -> 
                             [Change cxt $ ReplaceImpulse $ replace impulse n]
     where replace (FloatImpulse (AddFloat n')) n = FloatData $ n' + n
+          replace (FloatImpulse (MultiplyFloat n')) n = FloatData $ n' * n
+          replace (ReplaceImpulse n) _ = n
+  compile (FloatReplaceToProduct)
+    = StatefulCompilation Nothing $
+                          \(Change cxt impulse) (FloatData n) ->
+                            [Change cxt $ prodf impulse n]
+    where prodf (ReplaceImpulse (FloatData 0)) oldn = ReplaceImpulse $ FloatData 0
+          prodf (ReplaceImpulse n) 0 = ReplaceImpulse n
+          prodf (ReplaceImpulse (FloatData n)) oldn
+            = FloatImpulse $ MultiplyFloat $ n / oldn
+  compile (FloatReplaceToSum)
+    = StatefulCompilation Nothing $
+                          \(Change cxt impulse) (FloatData n) ->
+                            [Change cxt $ prodf impulse n]
+    where prodf ~(ReplaceImpulse n) 1 = ReplaceImpulse n
+          prodf (ReplaceImpulse (FloatData n)) oldn
+            = FloatImpulse $ AddFloat $ n - oldn
+
+
 
 
 type LandingSite = Int
 type Propagators = Map.Map Int [Int]
 type Modifiers = Map.Map Int Compiled
 type LookupPaths = Map.Map Int [Lookup]
+type PropOrder = Map.Map Int Int
 
-fullCompile :: AnyNode -> (LandingSite, Propagators, Modifiers, LookupPaths)
+fullCompile :: AnyNode -> (LandingSite, Propagators, Modifiers, LookupPaths, PropOrder)
 fullCompile w = (aNodeId w,
                  compilePropagators w,
                  compileModifiers w,
-                 compileLookupPaths w)
+                 compileLookupPaths w,
+                 aNodePropOrder w)
 
 compilePropagators :: AnyNode -> Propagators
 compilePropagators = (foldr compilePropagators' Map.empty) . allWatchables
@@ -373,65 +480,64 @@ compileLookupPaths' p (Just (AnyNode w)) = Map.unions (empty:more)
         more = [compileLookupPaths' (l:p) n
                |(l,n) <- watchablePaths (nodeId w) (nodeW w)]
 
-getLandingChanges :: (LandingSite, Propagators, Modifiers, LookupPaths) -> 
-                     Impulse ->
-                     Data -> 
-                     Int -> 
-                     [Change]
-getLandingChanges compiled imp stateValue node
-  = getLandingChanges' compiled change stateValue node
-  where change = Change Map.empty imp
+mergeChanges :: (LandingSite, Propagators, Modifiers, LookupPaths, PropOrder) ->
+                [(Int,Change)] ->
+                [(Int,Change)] ->
+                [(Int,Change)]
+             
+mergeChanges (_,_,_,_,propOrder) changes1 changes2
+  = List.sortBy (compare `Data.Function.on` ((flip (Map.findWithDefault 0) propOrder) . fst)) $ changes1 ++ changes2
 
-getLandingChanges' :: (LandingSite, Propagators, Modifiers, LookupPaths) ->
+getNextChanges :: (LandingSite, Propagators, Modifiers, LookupPaths, PropOrder) ->
                       Change ->
                       Data ->
                       Int ->
-                      [Change]
-getLandingChanges' compiled@(landingSite, propss, mods, paths)
-                   change@(Change contextFromChange _)
-                   stateValue
-                   node
-  = landing ++ 
-    (concat [ getLandingChanges' compiled c stateValue l
-            | l <- trace (show node ++ ": jumping to " ++ show props) props,
-              c <- trace (show node ++ ": transforming " ++ show change) $
-                   trace (show node ++ ": to " ++ show hereChanges) $
-                         hereChanges
-            ]) ++
-    (concat [getLandingChanges' compiled c stateValue l
-            |(l,c) <- elsewhereChanges])
+                      [(Int,Change)]
+getNextChanges compiled@(landingSite, propss, mods, paths, proporder)
+               change@(Change contextFromChange _)
+               stateValue
+               node
+  = [(prop, hereChange) | prop <- props, hereChange <- hereChanges] ++
+    elsewhereChanges
   where props = maybe [] id $ Map.lookup node propss
         mod = fromJustNote ("No modifier for " ++ show node) $ Map.lookup node mods
         locatedChanges = case mod of 
                            SimpleCompilation f -> 
                              [(node, c) | c <- f change]
                            StatefulCompilation stateId f -> 
-                             [(node, c) | c <- f change (stateValueAt stateId)]
+                             [(node, c)
+                             | c <- f change (stateValueAt stateId)] ++ 
+                             (stateValueWatchers stateId)
+                           PartiallyTargetedCompilation stateId f ->
+                             let (untargeted, targeted) = f change (stateValueAt stateId)
+                              in [(node, c) | c <- untargeted] ++ targeted
                            TargetedCompilation stateId f ->
-                             f change (stateValueAt stateId)
+                             (f change (stateValueAt stateId)) ++ 
+                             (stateValueWatchers stateId)
         hereChanges      = [c      | (l, c) <- locatedChanges, l == node]
         elsewhereChanges = [(l, c) | (l, c) <- locatedChanges, l /= node]
                              
-        stateValueAt stateId = let i = fromJustDef node stateId
-                                   mp = Map.lookup i paths
-                                   p = fromJustNote ("No path for " ++ show i ++ 
-                                                     " for " ++ show paths)
-                                                    mp
-                                in lookupByPath p contextFromChange stateValue
+        getStateValue stateId = let i = fromJustDef node stateId
+                                    mp = Map.lookup i paths
+                                    p = fromJustNote ("No path for " ++ show i ++ 
+                                                        " for " ++ show paths)
+                                                       mp
+                                 in lookupByPath p contextFromChange stateValue
+        stateValueWatchers = snd . getStateValue
+        stateValueAt = fst . getStateValue
 
-
-        landing = if node == landingSite then hereChanges else []
-getLandingChanges' (_, _, _, paths)
-                   change@(AddWatcher nodeToWatch keyToWatch watchingContext)
-                   stateValue
-                   watchingNode
-  = [Change (Map.insert nodeToWatch 
-                       (MapPath keyToWatch)
-                       (addPathToContext p watchingContext))
-            (AddWatcherImpulse nodeToWatch
-                               watchingNode
-                               keyToWatch
-                               watchingContext)]
+getNextChanges (landingSite, _, _, paths,_)
+               change@(AddWatcher nodeToWatch keyToWatch watchingContext)
+               stateValue
+               watchingNode
+  = [(landingSite,
+      Change (Map.insert nodeToWatch 
+                        (MapPath keyToWatch)
+                        (addPathToContext p watchingContext))
+             (AddWatcherImpulse nodeToWatch
+                                watchingNode
+                                keyToWatch
+                                watchingContext))]
   where mp = Map.lookup nodeToWatch paths
         p = fromJustNote ("No path for AddWatcher " ++ show nodeToWatch ++
                           " for " ++ show paths)
@@ -448,16 +554,19 @@ getLandingChanges' (_, _, _, paths)
                        (addPathToContext path ctx)
         addPathToContext [] ctx = ctx
        
-lookupByPath [] _ v = v
+lookupByPath [] _ v = (v, [])
 lookupByPath ((LookupMap _ k):p) ctx (MapData _ _ d _ m)
-  = lookupByPath p ctx v
+  = (v', changes ++ changes')
   where ctxElement = fromJustNote ("No " ++ show k ++ 
                                     " in context when doing path lookup") $
                                   Map.lookup k ctx
         ctxPath = case ctxElement of
                     MapPath v -> v
                     _ -> error "Got structpath when needed mappath"
-        v = fromJustDef d $ Map.lookup ctxPath m
+        maybeValue = Map.lookup ctxPath m
+        maybeValueWithChanges = fmap (,[]) maybeValue
+        (v,changes) = fromJustDef (defaultValue d ctx) maybeValueWithChanges
+        (v',changes') = lookupByPath p ctx v
 lookupByPath ((LookupStruct _ t):p) ctx (StructData _ m)
   = lookupByPath p ctx v
   where v = fromJustNote ("No " ++ show t ++ 
@@ -465,40 +574,57 @@ lookupByPath ((LookupStruct _ t):p) ctx (StructData _ m)
                          Map.lookup t m
 
 applyChange compiled stateWatchable nodeWatchable stateValue impulse
-  = let landingChanges = getLandingChanges compiled impulse stateValue (nodeId nodeWatchable)
-     in applyChanges stateWatchable landingChanges stateValue
+  = applyChanges compiled
+                 stateValue
+                 [(nodeId nodeWatchable, Change Map.empty impulse)]
 
-applyChanges stateWatchable changes stateValue
-  = foldr (\c s -> let result = applyLandingChange c s
-                    in trace ("applying change " ++ show c ++ 
-                              "\n  to state " ++ show s ++ 
-                              "\n  yielding " ++ show result) $
-                       applyLandingChange c s)
-          stateValue changes
+compiledLandingSite (landingSite, _, _, _, _) = landingSite
+
+applyChanges compiled stateValue [] = stateValue
+applyChanges compiled stateValue ((nodeId, change):changes)
+  = trace (show nodeId ++ ":\ttaking " ++ show change ++
+                               "\n        to     " ++ show newChanges) $
+    applyChanges compiled stateValue' $ changesFromDefaults ++
+                                        (mergeChanges compiled changes newChanges)
+  where newChanges = getNextChanges compiled change stateValue nodeId
+        (stateValue', changesFromDefaults) | nodeId == compiledLandingSite compiled 
+                                           = trace (show nodeId ++ " landing " ++ show change) $
+                                             applyLandingChange change stateValue
+                                           | otherwise
+                                           = (stateValue,[])
 
 applyLandingChange (Change context impulse) mapData@(MapData id shufflerId def watchers map)
   = case impulse of
       (AddWatcherImpulse mapToWatchId _ _ _) ->
-        if trace ("checking addWatcherImpulse " ++ show (mapToWatchId, id)) $ mapToWatchId == id
-          then applyImpulse impulse mapData
+        if mapToWatchId == id
+          then (applyImpulse impulse mapData,[])
           else recurse
       otherwise ->
         recurse
-  where pElem = fromJustNote ("can't find context for map " ++ show shufflerId ++ " in " ++ show context ++ " for " ++ show impulse) $
+  where pElem = fromJustNote ("can't find context for map " ++ show shufflerId
+                                 ++ " in " ++ show context
+                                 ++  " for " ++ show impulse) $
                              Map.lookup shufflerId context
         (MapPath p) = pElem
-        recurse = MapData id shufflerId def watchers $ Map.alter go
-                                                                 p
-                                                                 map
-        go = Just . applyLandingChange (Change context impulse) . fromJustDef def
+        maybeOldValue = Map.lookup p map
+        (oldValue, newWatchers) = case maybeOldValue of
+                                    Nothing -> defaultValue def context
+                                    Just v -> (v, [])
+        (value, newWatchers') = applyLandingChange (Change context impulse) oldValue
+        map' = Map.insert p value map
+        recurse = (MapData id shufflerId def watchers map', newWatchers ++ newWatchers')
 applyLandingChange (Change context impulse) (StructData id struct)
-  = StructData id  $ Map.alter (fmap (applyLandingChange $ Change context impulse))
-                               p
-                               struct
-  where pElem = fromJustNote ("can't find context for map " ++ show id) $
+  = case Map.lookup p struct of
+      Just a -> let (v, changes) = applyLandingChange (Change context
+                                                              impulse)
+                                                      a
+                 in (StructData id $ Map.insert p v struct, changes)
+      Nothing -> error "this should never happen"
+ 
+  where pElem = fromJustNote ("can't find context for struct " ++ show id) $
                              Map.lookup id context
         (StructPath p) = pElem
-applyLandingChange (Change context impulse) value = applyImpulse impulse value
+applyLandingChange (Change context impulse) value = (applyImpulse impulse value,[])
 
 applyImpulse (ReplaceImpulse d) _ = d
 applyImpulse (ListImpulse impulse) (ListData value) = ListData $ go impulse value
@@ -507,11 +633,12 @@ applyImpulse (ListImpulse impulse) (ListData value) = ListData $ go impulse valu
 applyImpulse (IntImpulse impulse) (IntegerData value) = IntegerData $ go impulse value
   where go (AddInteger m) n = m + n
         go (MultiplyIntegerF m) n = round $ m * (fromInteger n)
+        go (MultiplyInteger m) n = m * n
 applyImpulse (FloatImpulse impulse) (FloatData value) = FloatData $ go impulse value
   where go (AddFloat m) n = m + n
         go (MultiplyFloat m) n = m * n
 applyImpulse (AddWatcherImpulse nodeToWatch watchId key context) (MapData id shufflerId def watchers map)
-  = MapData id shufflerId def newWatchers map
+  = trace ("watching " ++ show id ++ " key=" ++ show key) $ MapData id shufflerId def newWatchers map
   where newWatchers = Map.alter go key watchers
         elt = (watchId, context)
         go Nothing = Just $ Set.singleton elt
@@ -523,25 +650,45 @@ type Func = State Int
 mkWatchable :: forall w. (Watchable w) => [AnyNode] -> w -> Func (Node w)
 mkWatchable inners watchable = do id <- getNextId
                                   return $ Node id inners (Just watchable)
+mkTube inners = do id <- getNextId
+                   return $ Node id inners Nothing
+
 getNextId :: Func Int
 getNextId = do i <- get
                let i' = i + 1
                i' `seq` put i'
                return i
 
+anyNode :: (Watchable a, PPrint a) => Node a -> Func AnyNode
+anyNode n = return $ AnyNode n
+
 -- precondition: ns only receive add changes
 sumList :: List Prelude.Integer -> Func Integer
 sumList ns = mkWatchable [AnyNode ns] SumInteger
+
+-- precondition: ns only receive add changes
+sumMSet :: MSet Float -> Func Float
+sumMSet ns = mkWatchable [AnyNode ns] SumFloat
 
 -- precondition: ns only receive multiply changes
 productMSet :: MSet Integer -> Func Integer
 productMSet ns = mkWatchable [AnyNode ns] ProductInteger
 
-sumToReplace :: Integer -> Func Integer
-sumToReplace n = mkWatchable [AnyNode n] SumToReplaceInteger
+integerToReplace :: Integer -> Func Integer
+integerToReplace n = mkWatchable [AnyNode n] ToReplaceInteger
 
-replaceToProduct :: Integer -> Func Integer
-replaceToProduct n = mkWatchable [AnyNode n] ReplaceToProduct
+integerReplaceToProduct :: Integer -> Func Integer
+integerReplaceToProduct n = mkWatchable [AnyNode n] IntegerReplaceToProduct
+
+
+floatToReplace :: Float -> Func Float
+floatToReplace n = mkWatchable [AnyNode n] ToReplaceFloat
+
+floatReplaceToSum :: Float -> Func Float
+floatReplaceToSum n = mkWatchable [AnyNode n] FloatReplaceToSum
+
+floatReplaceToProduct :: Float -> Func Float
+floatReplaceToProduct n = mkWatchable [AnyNode n] FloatReplaceToProduct
 
 intToFloat :: Integer -> Func Float
 intToFloat n = mkWatchable [AnyNode n] IntToFloat
@@ -566,12 +713,6 @@ filterList :: forall a. (Datable a)
            => (a -> Bool) -> List a -> Func (List a)
 filterList f l = mkWatchable [AnyNode l] (FilterList f)
 
-dictValues :: (Datable k, Watchable v) => Dict k (Node v) -> Func (MSet (Node v))
-dictValues node@(Node _ _ (Just dict))
-  = mkWatchable [AnyNode node] $
-                DictValuesMSet (dictShuffler dict)
-                               (dictMembersDefaultValue dict)
-
 shuffle :: forall a k. (Datable a, Datable k)
         => (a -> k) -> List a -> Func (Dict k (List a))
 shuffle f l = do id <- getNextId
@@ -583,16 +724,29 @@ mapDict f = mapDictWithKey (\k v -> f v)
 
 mapDictWithKey :: forall k v0 v. (Datable k, Watchable v0, Watchable v)
                => (DictKey k -> Node v0 -> Func (Node v)) -> Dict k (Node v0) -> Func (Dict k (Node v))
-mapDictWithKey f d = do funnelId <- getNextId
-                        let funnel = Node funnelId [AnyNode d] Nothing
-                        output <- f (DictKey d) funnel
-                        def <- f (DictKey d) (dictMembersDefaultValue $ nodeW d)
+mapDictWithKey f d = do output <- case nodeW d of
+                                    (MapDict _ n) -> f (DictKey d) n
+                                    otherwise -> do funnel <- mkTube [AnyNode d]
+                                                    f (DictKey d) funnel
                         result <- mkWatchable [AnyNode output]
-                                              (MapDict context def output)
+                                              (MapDict context output)
                         return result
       where context :: Int
             context = dictShuffler (nodeW d)
 
+dictValues :: forall k v. (Datable k, Watchable v) => Dict k (Node v) -> Func (MSet (Node v))
+dictValues node@(Node _ _ (Just dict))
+  = mkWatchable [AnyNode node] $
+                DictValuesMSet (dictShuffler dict)
+                               (dictMembersDefaultValue dict)
+
+
+structLookup :: Watchable a => Text -> Struct -> Func (Node a)
+structLookup key struct
+  = do lookup <- mkWatchable [AnyNode struct]
+                             (StructLookup key struct)
+       id <- getNextId
+       return $ Node id [AnyNode lookup] Nothing
 
 dictLookup :: (Datable k, Watchable v) =>
                DictKey k ->
@@ -602,9 +756,9 @@ dictLookup key map
   = do lookup <- mkWatchable [AnyNode map] 
                              (DictLookup key
                                          (dictShuffler $ nodeW map)
-                                         (nodeInitialValue $ dictMembersDefaultValue $ nodeW map))
+                                         (DefaultNode $ dictMembersDefaultValue $ nodeW map))
        id <- getNextId
-       return $ Node id [AnyNode lookup] Nothing
+       return $ Node id [AnyNode lookup] Nothing -- make a tube so it can come out with the right type
 
 dictSlowLookup :: (PPrint v, Datable k, Watchable v) =>
                   DictSlowKey k ->
@@ -615,7 +769,7 @@ dictSlowLookup key@(DictSlowKey context f) map
                             (DictSlowLookup key
                                             (nodeId map)
                                             (dictShuffler $ nodeW map)
-                                            (nodeInitialValue $ dictMembersDefaultValue $ nodeW map))
+                                            (DefaultNode $ dictMembersDefaultValue $ nodeW map))
       escaper <- mkWatchable [AnyNode map]
                              (DictSlowLookupPropagator (nodeId map))
       id <- getNextId
@@ -627,9 +781,13 @@ dictSlowKey (DictKey n) f = DictSlowKey n f
 mapSlowKey :: (Datable k, Datable k') => DictSlowKey k -> (k -> k') -> DictSlowKey k'
 mapSlowKey (DictSlowKey n f1) f2 = DictSlowKey n (f2 . f1)
 
+-- this is totally not typesafe
+const :: (Datable k, Watchable w) => k -> Func (Node w)
+const c = do a <- mkWatchable [] (Const c)
+             mkTube [AnyNode a]
+
 inputList :: Func (List a)
-inputList = do id <- getNextId
-               return $ Node id [] Nothing
+inputList = mkTube []
 
 struct :: [(Text, Func AnyNode)] -> Func Struct
 struct elemTuples = do id <- getNextId
@@ -643,9 +801,25 @@ struct elemTuples = do id <- getNextId
                              [v]
                              (Just $ StructElem structId label v)
 
+anyNodeEdges (AnyNode node) = nodeEdges node
+nodeEdges :: forall a. Node a -> [Graph.Edge]
+nodeEdges node = [(aNodeId i,nodeId node) | i <- nodeInners node] ++ 
+                 (concatMap anyNodeEdges (nodeInners node))
+
+nodeGraph node = Graph.buildG (least,most) edges
+  where edges = nodeEdges node
+        allVertices = (map fst edges) ++ (map snd edges)
+        least = minimum allVertices
+        most = maximum allVertices
+nodePropOrder = mkMap . reverse . Graph.topSort . nodeGraph
+  where mkMap ids = Map.fromList $ zip ids [0..]
+aNodePropOrder (AnyNode a) = nodePropOrder a
+
 class PPrint a where
   pprint :: a -> String
 
+instance PPrint (ConstW k) where
+  pprint (Const _) = "Const"
 instance PPrint StructW where
   pprint (Struct _) = "Struct"
 instance PPrint StructElemW where
@@ -655,11 +829,13 @@ instance PPrint (ListW a) where
   pprint (FilterList _) = "FilterList"
 instance PPrint (DictW k v) where
   pprint (ShuffleList _ _) = "ShuffleList"
-  pprint (MapDict shufflerId _ _) = "MapDict(shufflerId=" ++ show shufflerId ++ ")"
+  pprint (MapDict shufflerId _) = "MapDict(shufflerId=" ++ show shufflerId ++ ")"
 instance PPrint (MSetW a) where
   pprint (DictValuesMSet _ _) = "DictValuesMSet"
 instance PPrint (DictLookupW v) where
   pprint (DictLookup _ _ _) = "DictLookup"
+instance PPrint (StructLookupW) where
+  pprint (StructLookup _ _) = "StructLookup"
 instance PPrint (DictSlowLookupW v) where
   pprint (DictSlowLookup _ _ _ _) = "DictSlowLookup"
 instance PPrint (DictSlowLookupPropagatorW) where
@@ -667,11 +843,15 @@ instance PPrint (DictSlowLookupPropagatorW) where
 instance PPrint (IntegerW) where
   pprint (SumInteger) = "SumInteger"
   pprint (ProductInteger) = "ProductInteger"
-  pprint (SumToReplaceInteger) = "SumToReplaceInteger"
-  pprint (ReplaceToProduct) = "ReplaceToProduct"
+  pprint (ToReplaceInteger) = "ToReplaceInteger"
+  pprint (IntegerReplaceToProduct) = "IntegerReplaceToProduct"
+  pprint (IntegerReplaceToSum) = "IntegerReplaceToSum"
 instance PPrint (FloatW) where
   pprint (SumFloat) = "SumFloat"
   pprint (ProductFloat) = "ProductFloat"
+  pprint (FloatReplaceToSum) = "FloatReplaceToSum"
+  pprint (FloatReplaceToProduct) = "FloatReplaceToProduct"
+  pprint (ToReplaceFloat) = "ToReplaceFloat"
   pprint (InvFloat) = "InvFloat"
   pprint (IntToFloat) = "IntToFloat"
 
