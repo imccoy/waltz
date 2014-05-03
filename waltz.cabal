@@ -10,12 +10,13 @@ Executable waltz
   Hs-Source-Dirs: src
   Main-Is: Main.hs
   Extensions: ExistentialQuantification,
-              MultiParamTypeClasses,
-              OverloadedStrings,
-              GADTs,
-              ScopedTypeVariables,
               FlexibleInstances,
               FlexibleContexts,
-              TupleSections
+              GADTs,
+              MultiParamTypeClasses,
+              OverloadedStrings,
+              ScopedTypeVariables,
+              TupleSections,
+              ViewPatterns
   build-depends: base, containers, text, safe, mtl
   ghc-options: -Werror -fwarn-unused-imports

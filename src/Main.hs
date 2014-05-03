@@ -1,9 +1,10 @@
 import qualified Waltz as W
 import Waltz (Data (..), Datable (..))
 import Control.Monad.State
+import qualified Data.Map as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import qualified Data.Map as Map
+import qualified Data.Set as Set 
 
 data Link = Link Url Url
 linkFrom (Link from _) = from
@@ -14,6 +15,9 @@ instance Datable Link where
   fromData (ListData [StringData "Link", from, to]) = Link (fromData from) (fromData to)
   fromData e = error $ "Can't fromData event " ++ show e
 
+instance W.UniverseDatable Link where
+  toUniverseData' = W.toUniverseDataScalar
+  initialUniverse' = error "can't initialUniverse a link"
 
 type Url = Text
 type InLinks = W.MSet Url
@@ -84,63 +88,63 @@ pageRank' n' n web outdegrees scores0
                   return (scores, (Text.pack ("iteration" ++ show n'), W.anyNode struct0):struct)
 
 
-data Event = A Text Integer
-           | B Text Text
-
-instance Datable Event where
-  toData (A w d) = ListData [StringData "A", toData w, toData d]
-  toData (B w1 w2) = ListData [StringData "B", toData w1, toData w2]
-  fromData (ListData [StringData "A", w, d]) = A (fromData w) (fromData d)
-  fromData (ListData [StringData "B", w1, w2]) = B (fromData w1) (fromData w2)
-  fromData e = error $ "Can't fromData event " ++ show e
-
-isA (A _ _) = True
-isA _ = False
-
-numA (A _ n) = n
-textA (A t _) = t
-
-t1B (B t _) = t
-t2B (B _ t) = t
-
-
-appState :: W.List Event -> W.Func W.Struct
-appState evts = 
-  do sumOfA <- return evts >>=
-               W.filterList isA >>=
-               W.shuffle textA >>=
-               W.mapDict (\as -> W.mapList numA as >>=
-                                 W.sumList)
-     sumOfAAsReplaces <- W.mapDict W.integerToReplace sumOfA
-     sumOfAAsProducts <- W.mapDict W.integerReplaceToProduct sumOfAAsReplaces
-     shuffledBs <- return evts >>= W.filterList (not . isA) >>= W.shuffle t1B
-     bs <- W.mapDict (\bs ->
-                        W.shuffle t2B bs >>= 
-                        W.mapDictWithKey (\k _ -> W.dictSlowLookup (W.dictSlowKey k id) sumOfAAsProducts)  >>=
-                        W.dictValues >>=
-                        W.productMSet)
-                      shuffledBs
-     bsAsFloat <- W.mapDict W.intToFloat bs
-     bsLengths <- W.mapDict (\bs -> W.lengthList bs)
-                            shuffledBs
-     bsLengthsAsReplaces <- W.mapDict W.integerToReplace bsLengths
-     bsLengthsAsProducts <- W.mapDict W.integerReplaceToProduct bsLengthsAsReplaces
-     bsLengthsAsFloat <- W.mapDict W.intToFloat bsLengthsAsProducts
-     W.struct [
-       ("sum", W.anyNode sumOfA),
-       ("sumOfAAsReplaces", W.anyNode sumOfAAsReplaces),
-       ("sumOfAAsProducts", W.anyNode sumOfAAsProducts),
-       ("productOfSums", fmap W.AnyNode $ W.productMSet =<< W.dictValues sumOfAAsProducts),
-       ("bs", W.anyNode bs),
-       ("bsLengths", W.anyNode bsLengths),
-       ("bsLengthsAsReplaces", W.anyNode bsLengthsAsReplaces),
-       ("bsLengthsAsProducts", W.anyNode bsLengthsAsProducts),
-       ("bsLengthsAsFloat", W.anyNode bsLengthsAsFloat),
-       ("quotients", fmap W.AnyNode $ W.mapDictWithKey (\k bsLength -> do
-                                                          bs' <- W.dictLookup k bsAsFloat
-                                                          W.divide bs' bsLength
-                                                       )
-                                                       bsLengthsAsFloat)]
+--data Event = A Text Integer
+--           | B Text Text
+--
+--instance Datable Event where
+--  toData (A w d) = ListData [StringData "A", toData w, toData d]
+--  toData (B w1 w2) = ListData [StringData "B", toData w1, toData w2]
+--  fromData (ListData [StringData "A", w, d]) = A (fromData w) (fromData d)
+--  fromData (ListData [StringData "B", w1, w2]) = B (fromData w1) (fromData w2)
+--  fromData e = error $ "Can't fromData event " ++ show e
+--
+--isA (A _ _) = True
+--isA _ = False
+--
+--numA (A _ n) = n
+--textA (A t _) = t
+--
+--t1B (B t _) = t
+--t2B (B _ t) = t
+--
+--
+--appState :: W.List Event -> W.Func W.Struct
+--appState evts = 
+--  do sumOfA <- return evts >>=
+--               W.filterList isA >>=
+--               W.shuffle textA >>=
+--               W.mapDict (\as -> W.mapList numA as >>=
+--                                 W.sumList)
+--     sumOfAAsReplaces <- W.mapDict W.integerToReplace sumOfA
+--     sumOfAAsProducts <- W.mapDict W.integerReplaceToProduct sumOfAAsReplaces
+--     shuffledBs <- return evts >>= W.filterList (not . isA) >>= W.shuffle t1B
+--     bs <- W.mapDict (\bs ->
+--                        W.shuffle t2B bs >>= 
+--                        W.mapDictWithKey (\k _ -> W.dictSlowLookup (W.dictSlowKey k id) sumOfAAsProducts)  >>=
+--                        W.dictValues >>=
+--                        W.productMSet)
+--                      shuffledBs
+--     bsAsFloat <- W.mapDict W.intToFloat bs
+--     bsLengths <- W.mapDict (\bs -> W.lengthList bs)
+--                            shuffledBs
+--     bsLengthsAsReplaces <- W.mapDict W.integerToReplace bsLengths
+--     bsLengthsAsProducts <- W.mapDict W.integerReplaceToProduct bsLengthsAsReplaces
+--     bsLengthsAsFloat <- W.mapDict W.intToFloat bsLengthsAsProducts
+--     W.struct [
+--       ("sum", W.anyNode sumOfA),
+--       ("sumOfAAsReplaces", W.anyNode sumOfAAsReplaces),
+--       ("sumOfAAsProducts", W.anyNode sumOfAAsProducts),
+--       ("productOfSums", fmap W.AnyNode $ W.productMSet =<< W.dictValues sumOfAAsProducts),
+--       ("bs", W.anyNode bs),
+--       ("bsLengths", W.anyNode bsLengths),
+--       ("bsLengthsAsReplaces", W.anyNode bsLengthsAsReplaces),
+--       ("bsLengthsAsProducts", W.anyNode bsLengthsAsProducts),
+--       ("bsLengthsAsFloat", W.anyNode bsLengthsAsFloat),
+--       ("quotients", fmap W.AnyNode $ W.mapDictWithKey (\k bsLength -> do
+--                                                          bs' <- W.dictLookup k bsAsFloat
+--                                                          W.divide bs' bsLength
+--                                                       )
+--                                                       bsLengthsAsFloat)]
 
 prepare :: (W.Func (W.List e)) -> (W.List e -> (W.Func s)) -> ((W.List e),s)
 prepare input f = evalState go 0
@@ -161,23 +165,21 @@ main = do
                         ]
           let (inputList, state) = prepare W.inputList appState
 -}
-          let links = [Link "http://podunk.com" "http://www.yahoo.com",
-                       Link "http://www.yahoo.com" "http://okay.com",
-                       Link "http://nothing.com" "http://www.yahoo.com",
-                       Link "http://nothing.com" "http://podunk.com",
-                       Link "http://okay.com" "http://nothing.com"
+          let links = [Link "A" "B",
+                       Link "A" "C"
                      ]
           let (inputList, state) = prepare W.inputList (pageRank 1)
-          let initialState = fst $ W.nodeInitialValue state Map.empty
+          let universe = W.initialUniverse Set.empty state 
           putStrLn $ W.printNode state
+          putStrLn $ unlines [ show u | u <- Map.toList universe]
           let compiled = W.fullCompile $ W.AnyNode state
-          let finalState = foldl (\s i -> W.trace (show s) $ W.applyChange compiled state inputList s i)
-                                 initialState
+          let finalUniverse = foldl (\s i -> W.trace (show s) $ W.applyChange compiled state inputList s i)
+                                 universe
                                  [W.ListImpulse $ W.AddElement $ W.toData c | c <- links]
                              --  [W.ListImpulse $ W.AddElement $ W.toData c | c <- changes]
-          putStrLn $ show finalState
-          let structMap (StructData _ m) = m
-          let dictMap (MapData _ _ _ _ m) = m
-          let iteration = Map.findWithDefault undefined "iteration0" $ structMap finalState
-          let scores = dictMap $ Map.findWithDefault undefined "scores" $ structMap iteration
-          putStrLn $ show $ Map.map (\s -> Map.findWithDefault undefined "score" $ structMap s) scores
+          putStrLn $ W.printUniverseData $ W.toUniverseData state finalUniverse
+          --let structMap (StructData _ m) = m
+          --let dictMap (MapData _ _ _ _ m) = m
+          --let iteration = Map.findWithDefault undefined "iteration0" $ structMap finalState
+          --let scores = dictMap $ Map.findWithDefault undefined "scores" $ structMap iteration
+          --putStrLn $ show $ Map.map (\s -> Map.findWithDefault undefined "score" $ structMap s) scores
