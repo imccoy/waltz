@@ -350,8 +350,8 @@ toUniverseData (Node _ (n:_) Nothing) = aToUniverseData n
 toUniverseData n = toUniverseData' n
 
 instance UniverseDatable StructW where
-  initialUniverse' rc (Node id _ (Just (Struct elems))) = trace ("struct initialuniverse " ++ show id) $ Map.unions $ map universeElem elems
-    where universeElem (label, w) = trace ("struct initialuniverse member " ++ show (aNodeId w)) $ aInitialUniverse rc w
+  initialUniverse' rc (Node id _ (Just (Struct elems))) = Map.unions $ map universeElem elems
+    where universeElem (label, w) = aInitialUniverse rc w
   toUniverseData' (Node id inners (Just (Struct elems))) universe
     = UniverseStruct $ foldr addElem Map.empty elems
     where addElem (label, w) map = Map.insert label (aToUniverseData w universe) map
@@ -444,14 +444,12 @@ instance UniverseDatable (DictSlowLookupW v) where
     = UniverseData $ StringData "This is a slow dict lookup"
   initialUniverse' rc node = Map.empty
 
-type LandingSite = Int
 type Propagators = Map.Map Int [Int]
 type Modifiers = Map.Map Int Compiled
 type PropOrder = Map.Map Int Int
 
-fullCompile :: AnyNode -> (LandingSite, Propagators, Modifiers, PropOrder)
-fullCompile w = (aNodeId w,
-                 compilePropagators w,
+fullCompile :: AnyNode -> (Propagators, Modifiers, PropOrder)
+fullCompile w = (compilePropagators w,
                  compileModifiers w,
                  aNodePropOrder w)
 
@@ -479,26 +477,31 @@ allWatchables' w = w:(concat (map allWatchables $ aNodeInners w))
 uniqBy f [] = []
 uniqBy f (w:ws) = w:(uniqBy f [w' | w' <- ws, f w /= f w'])
 
-mergeChanges :: (LandingSite, Propagators, Modifiers, PropOrder) ->
+mergeChanges :: (Propagators, Modifiers, PropOrder) ->
                 [(Int,Change)] ->
                 [(Int,Change)] ->
                 [(Int,Change)]
              
-mergeChanges (_,_,_,propOrder) changes1 changes2
+mergeChanges (_,_,propOrder) changes1 changes2
   = List.sortBy (compare `Data.Function.on` ((flip (Map.findWithDefault 0) propOrder) . fst)) $ changes1 ++ changes2
 
-getNextChanges :: (LandingSite, Propagators, Modifiers, PropOrder) ->
+getNextChanges :: (Propagators, Modifiers, PropOrder) ->
                       Change ->
                       Universe ->
                       Int ->
                       ([(Int,Change)],[Watch])
-getNextChanges compiled@(landingSite, propss, mods, proporder)
+getNextChanges compiled@(propss, mods, proporder)
                change@(Change contextFromChange impulse)
                universe
                node
-  = ([(prop, change) | prop <- props, change <- changes], watchers)
+  = ([(prop, change) | prop <- props, change <- changes] ++ slowchanges, watchers)
   where props = maybe [] id $ Map.lookup node propss
         mod = fromJustNote ("No modifier for " ++ show node) $ Map.lookup node mods
+        slowchanges = let us = Map.lookup node universe
+                          ws = case us of
+                                 Just us' -> Set.toList $ snd $ universeSliceGet us' contextFromChange
+                                 Nothing -> []
+                       in [(n, Change cxt impulse) | (n,cxt) <- ws]
         (changes,watchers) = case mod of 
                                SimpleCompilation f -> 
                                  (f change,[])
@@ -507,11 +510,11 @@ getNextChanges compiled@(landingSite, propss, mods, proporder)
                                DictLookupCompilation f ->
                                  let (dictId,shufflerId,outKey) = f change
                                      context = Map.insert shufflerId outKey contextFromChange
-                                     universeSlice = trace ("looking up universeSlice " ++ show dictId) $ Map.lookup dictId universe
+                                     universeSlice = Map.lookup dictId universe
                                      justUniverseSlice = fromJustNote ("no universe slice at " ++ show dictId) $
                                                                       universeSlice
                                      (value, watchers) = universeSliceGet justUniverseSlice context
-                                  in case trace ("DictLookupCompilation got " ++ show value ++ " adds watch " ++ show (node, contextFromChange, dictId, context)) $ isJust universeSlice && universeSliceAcceptsContext justUniverseSlice context of
+                                  in case isJust universeSlice && universeSliceAcceptsContext justUniverseSlice context of
                                        True  -> ([Change contextFromChange $ ReplaceImpulse value],
                                                  [Watch node contextFromChange
                                                         dictId context])
@@ -522,13 +525,11 @@ getNextChanges compiled@(landingSite, propss, mods, proporder)
                          su = fromJustNote ("No universe for " ++ show node ++ 
                                                   " for " ++ show universe)
                                                   msu
-                      in currentValueOrDefault contextFromChange su
+                      in fst $ universeSliceGet su contextFromChange
 applyChange compiled stateWatchable nodeWatchable stateValue impulse
   = applyChanges compiled
                  stateValue
                  [(nodeId nodeWatchable, Change Map.empty impulse)]
-
-compiledLandingSite (landingSite, _, _, _, _) = landingSite
 
 applyChanges compiled universe [] = universe
 applyChanges compiled universe ((nodeId, change):changes)
@@ -557,18 +558,12 @@ applyChanges compiled universe ((nodeId, change):changes)
                 su' = Map.insert reducedWatchedContext
                                  (val, watchers')
                                  su
-                universe' = Map.insert watchedId (def, rc, su') universe
-             in trace (show watchers ++ " -> " ++ show watchers' ++ " in " ++ show reducedWatchedContext ++ "(" ++ show rc ++ ")") universe'
-
-currentValueOrDefault :: Context -> UniverseSlice -> Data
-currentValueOrDefault context universeSlice
-  = fst $ universeSliceGet universeSlice context
+             in Map.insert watchedId (def, rc, su') universe
 
 applyLandingChange :: Change -> UniverseSlice -> UniverseSlice
 applyLandingChange (Change context impulse) (def, rc, vs)
-  = trace ("applyLandingChange " ++ show currentValue ++ " -> " ++ show newValue) $
-          (def, rc, Map.insert context (newValue, Set.empty) vs)
-  where currentValue = currentValueOrDefault context (def, rc, vs)
+  = (def, rc, Map.insert context (newValue, Set.empty) vs)
+  where currentValue = fst $ universeSliceGet (def, rc, vs) context
         newValue = applyImpulse impulse currentValue
 
 applyImpulse (ReplaceImpulse d) _ = d
@@ -582,14 +577,6 @@ applyImpulse (IntImpulse impulse) (IntegerData value) = IntegerData $ go impulse
 applyImpulse (FloatImpulse impulse) (FloatData value) = FloatData $ go impulse value
   where go (AddFloat m) n = m + n
         go (MultiplyFloat m) n = m * n
-{-
-applyImpulse (AddWatcherImpulse nodeToWatch watchId key context) (MapData id shufflerId def watchers map)
-  = trace ("watching " ++ show id ++ " key=" ++ show key) $ MapData id shufflerId def newWatchers map
-  where newWatchers = Map.alter go key watchers
-        elt = (watchId, context)
-        go Nothing = Just $ Set.singleton elt
-        go (Just s) = Just $ Set.insert elt s
--}
 applyImpulse impulse value = error $ "Can't apply impulse " ++ show impulse ++ " to " ++ show value
 
 type Func = State Int
