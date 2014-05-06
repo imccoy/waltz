@@ -173,7 +173,7 @@ main = do
           putStrLn $ W.printNode state
           putStrLn $ unlines [ show u | u <- Map.toList universe]
           let compiled = W.fullCompile $ W.AnyNode state
-          let finalUniverse = foldl (\s i -> W.trace (show s) $ W.applyChange compiled state inputList s i)
+          let finalUniverse = foldl (\s i -> W.trace (W.printUniverseData $ W.toUniverseData state s) $ W.applyChange compiled state inputList s i)
                                  universe
                                  [W.ListImpulse $ W.AddElement $ W.toData c | c <- links]
                              --  [W.ListImpulse $ W.AddElement $ W.toData c | c <- changes]

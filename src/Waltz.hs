@@ -139,6 +139,8 @@ class PPrint a => Watchable a where
   eval node@(Node _ ns _) cxt = (evalValue node, concat [snd (eval n cxt)|(AnyNode n) <- ns])
   evalValue :: Node a -> Data
   evalValue _ = error "no evalValue"
+  nodeDependencies :: Node a -> [AnyNode]
+  nodeDependencies (Node _ ds _) = ds
 
 data Node a = Node !Int [AnyNode] (Maybe a)
 
@@ -244,23 +246,27 @@ instance Watchable (MSetW a) where
 
 
 type DictSlowLookup k = Node (DictSlowLookupW k)
-data DictSlowLookupW k = DictSlowLookup (DictSlowKey k) Int Int
-instance Watchable (DictSlowLookupW v) where
+data DictSlowLookupW k = forall v. (Watchable v, Datable k) => DictSlowLookup (DictSlowKey k) (Dict k (Node v)) 
+instance Watchable (DictSlowLookupW k) where
 
-  compile (DictSlowLookup key valId shufflerId)
+  compile (DictSlowLookup key map)
     = DictLookupCompilation $ \(Change cxt _) ->
-        let outKey = dictSlowLookupOutKey key cxt
+        let valId = dictValId map
+            shufflerId = dictShuffler $ nodeW map
+            outKey = dictSlowLookupOutKey key cxt
          in trace ("DictSlowLookup going to key " ++ show outKey ++ " at " ++ show (valId, shufflerId)) (valId, shufflerId, outKey)
-  eval (Node id [AnyNode d] (Just (DictSlowLookup key valId shufflerId))) cxt
+  eval (Node id [AnyNode d] (Just (DictSlowLookup key map))) cxt
     = (v, watch:ws)
     where outKey = dictSlowLookupOutKey key cxt
           watch = Watch id cxt
-                        valId cxt'
+                        (dictValId map) cxt'
           (v, ws) = eval d cxt'
-          cxt' = (Map.insert shufflerId outKey cxt)
+          cxt' = (Map.insert (dictShuffler $ nodeW map) outKey cxt)
+
+  nodeDependencies (Node _ ds (Just (DictSlowLookup _ map))) = (AnyNode map):ds
 dictSlowLookupOutKey (DictSlowKey context f) cxt = toData $ f $ fromData inKey
   where contextId = dictShuffler $ nodeW context
-        inKey = fromJustNote ("DictSlowLookup " ++ show contextId ++ " styimed in " ++ show cxt) $
+        inKey = fromJustNote ("DictSlowLookup " ++ show contextId ++ " stymied in " ++ show cxt) $
                              Map.lookup contextId cxt
 
 
@@ -359,7 +365,7 @@ instance Watchable FloatW where
   compile (FloatReplaceToSum)
     = StatefulCompilation $ \(Change cxt impulse) (FloatData n) ->
                             [Change cxt $ prodf impulse n]
-    where prodf ~(ReplaceImpulse n) 1 = ReplaceImpulse n
+    where prodf ~(ReplaceImpulse n) 0 = ReplaceImpulse n
           prodf (ReplaceImpulse (FloatData n)) oldn
             = FloatImpulse $ AddFloat $ n - oldn
   evalValue (Node _ ns (Just v)) = go v
@@ -543,7 +549,7 @@ getNextChanges compiled@(_, propss, mods, _)
                                SimpleCompilation f -> 
                                  (f change,[])
                                StatefulCompilation f -> 
-                                 trace ("STATEFUL on " ++ show stateValue) ((f change stateValue),[])
+                                 trace ("STATEFUL " ++ show node ++ " on " ++ show stateValue) ((f change stateValue),[])
                                DictLookupCompilation f ->
                                  let (dictId,shufflerId,outKey) = f change
                                      context = Map.insert shufflerId outKey contextFromChange
@@ -741,9 +747,7 @@ dictSlowLookup :: (PPrint v, Datable k, Watchable v) =>
                   Func (Node v)
 dictSlowLookup key@(DictSlowKey context f) map
  = do lookup <- mkWatchable [AnyNode context]
-                            (DictSlowLookup key
-                                            (dictValId map)
-                                            (dictShuffler $ nodeW map))
+                            (DictSlowLookup key map)
       id <- getNextId
       return $ Node id [AnyNode lookup] Nothing
 
@@ -769,15 +773,17 @@ struct elemTuples = do elems <- mapM elem elemTuples
                return (label, v)
 
 anyNodeEdges (AnyNode node) = nodeEdges node
-nodeEdges :: forall a. Node a -> [Graph.Edge]
-nodeEdges node = [(aNodeId i,nodeId node) | i <- nodeInners node] ++ 
-                 (concatMap anyNodeEdges (nodeInners node))
+nodeEdges :: forall a. Watchable a => Node a -> [Graph.Edge]
+nodeEdges node = [(aNodeId i,nodeId node) | i <- nodeDependencies node] ++ 
+                 (concatMap anyNodeEdges (nodeDependencies node))
 
+nodeGraph :: forall a. Watchable a => Node a -> Graph.Graph
 nodeGraph node = Graph.buildG (least,most) edges
   where edges = nodeEdges node
         allVertices = (map fst edges) ++ (map snd edges)
         least = minimum allVertices
         most = maximum allVertices
+nodePropOrder :: forall a. Watchable a => Node a -> Map.Map Int Int
 nodePropOrder = mkMap . Graph.topSort . nodeGraph
   where mkMap ids = Map.fromList $ zip ids [0..]
 aNodePropOrder (AnyNode a) = nodePropOrder a
@@ -800,7 +806,7 @@ instance PPrint (MSetW a) where
 instance PPrint (DictLookupW v) where
   pprint (DictLookup _ _) = "DictLookup"
 instance PPrint (DictSlowLookupW v) where
-  pprint (DictSlowLookup _ _ _) = "DictSlowLookup"
+  pprint (DictSlowLookup _ _) = "DictSlowLookup"
 instance PPrint (IntegerW) where
   pprint (SumInteger) = "SumInteger"
   pprint (ProductInteger) = "ProductInteger"
