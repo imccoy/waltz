@@ -1,13 +1,29 @@
-Name: Waltz
+Name: waltz
 Version: 0.0
-Cabal-Version: >= 1.2
+Cabal-Version: >= 1.8
 License: BSD3
 Author: Iain McCoy
 Synopsis: The deranged blatherings of a madman
 Build-Type: Simple
 
-Executable waltz
-  Hs-Source-Dirs: src
+library
+  Hs-Source-Dirs: src/main
+  Extensions: ExistentialQuantification,
+              FlexibleInstances,
+              FlexibleContexts,
+              GADTs,
+              MultiParamTypeClasses,
+              OverloadedStrings,
+              ScopedTypeVariables,
+              TupleSections,
+              ViewPatterns
+  exposed-modules: Waltz
+  build-depends: base, containers, text, safe, mtl
+  ghc-options: -Werror -fwarn-unused-imports
+
+
+executable demo
+  Hs-Source-Dirs: src/demo
   Main-Is: Main.hs
   Extensions: ExistentialQuantification,
               FlexibleInstances,
@@ -18,5 +34,6 @@ Executable waltz
               ScopedTypeVariables,
               TupleSections,
               ViewPatterns
-  build-depends: base, containers, text, safe, mtl
+  build-depends: waltz, base, containers, text, safe, mtl
   ghc-options: -Werror -fwarn-unused-imports
+

@@ -28,11 +28,11 @@ pageRankIteration :: W.Dict Url (W.List Link) ->
                      W.Dict Url Score ->
                      W.Func (W.Dict Url Score, W.Struct)
 pageRankIteration web outdegrees scores
-  = do let outScore k s = do d <- W.dictSlowLookup (W.dictSlowKey k id) outdegrees
+  = do let outScore k s = do d <- W.dictLookup k outdegrees
                              d' <- W.intToFloat d
                              s `W.divide` d'
        outScores <- W.mapDictWithKey outScore scores
-       let inScore inLink _ = W.dictSlowLookup (W.dictSlowKey inLink id) outScores
+       let inScore inLink _ = W.dictLookup inLink outScores
        let score k inlinks = do dict <- W.shuffle linkFrom inlinks
                                 scoresDict <- W.mapDictWithKey inScore dict
                                 scoresDictAsReplaces <- W.mapDict W.floatToReplace scoresDict
