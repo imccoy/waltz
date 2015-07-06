@@ -5,13 +5,14 @@ import qualified Prelude as Prelude
 
 import Control.Monad.State
 import qualified Data.List as List
-import qualified Data.Map as Map
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Safe
 
 import qualified Debug.Trace as Trace
 
-debugMode = True
+debugMode = False
 
 trace = if debugMode then Trace.trace else (\x y -> y)
 
@@ -35,7 +36,7 @@ data IntImpulse = AddInteger !Prelude.Integer
 
 
 data Data = ListData ![Data]
-          | MapData !Int !Data !(Map.Map Data Data)
+          | DictData !Int !Data !(Map.Map Data Data)
           | StructData !Int !(Map.Map Text Data)
           | IntegerData !Prelude.Integer
           | StringData !Text
@@ -46,7 +47,7 @@ instance Show Data where
 
 
 showData (ListData xs) = show xs
-showData (MapData _ _ m) = show m
+showData (DictData _ _ m) = show m
 showData (StructData _ m) = show m
 showData (IntegerData i) = show i
 showData (StringData t) = show t
@@ -58,6 +59,13 @@ class Datable a where
 instance Datable a => Datable [a] where
   toData as = ListData $ map toData as
   fromData (ListData ds) = map fromData ds
+
+mapmap2 :: (Ord k1, Ord k2) => (k1 -> k2) -> (v1 -> v2) -> Map k1 v1 -> Map k2 v2
+mapmap2 fk fv = Map.mapKeys fk . Map.map fv
+
+instance (Monoid a, Datable k, Ord k, Datable a) => Datable (Map k a) where
+  toData = error "no toData for Map/Dict"
+  fromData (DictData _ _ dict) = mapmap2 fromData fromData dict
 
 instance Datable Prelude.Integer where
   toData i = IntegerData i
@@ -83,7 +91,7 @@ data Compiled = SimpleCompilation (Change -> [Change])
               | StatefulCompilation (Change -> Data -> [Change])
 
 class PPrint a => Watchable a where
-  initialValue :: Int -> [AnyNode] -> a -> Data
+  initialValue :: Int -> [AnyNode] -> Maybe a -> Data
   compile :: a -> Compiled
   watchablePaths :: a -> [(Lookup, Maybe AnyNode)]
   watchablePaths _ = []
@@ -99,7 +107,8 @@ nodeId (Node id _ _) = id
 nodeInners (Node _ inners _) = inners
 nodeW (Node _ _ (Just a)) = a
 
-nodeInitialValue (Node id inners (Just w)) = initialValue id inners w
+nodeInitialValue :: forall t. (Watchable t) => Node t -> Data
+nodeInitialValue (Node id inners w) = initialValue id inners w
 
 nodeCompile (Node _ _ Nothing) = SimpleCompilation $ return
 nodeCompile (Node _ _ (Just w)) = compile w
@@ -112,7 +121,8 @@ aNodeInitialValue (AnyNode w) = nodeInitialValue w
 type Struct = Node StructW
 data StructW = Struct [StructElem]
 instance Watchable StructW where
-  initialValue id _ (Struct elems) = StructData id $ foldr addElem Map.empty elems
+  initialValue _  _ Nothing = error "no initialValue for struct funnel"
+  initialValue id _ (Just (Struct elems)) = StructData id $ foldr addElem Map.empty elems
     where addElem :: StructElem -> (Map.Map Text Data) -> (Map.Map Text Data)
           addElem elem@(Node _ _ (Just (StructElem _ key _))) map
              = Map.insert key (nodeInitialValue elem) map
@@ -123,7 +133,8 @@ type StructElem = Node StructElemW
 data StructElemW = StructElem Int Text AnyNode
 
 instance Watchable StructElemW where
-  initialValue _ [w] (StructElem _ _ _) = aNodeInitialValue w
+  initialValue _  _ Nothing = error "no initialValue for structElem funnel"
+  initialValue _ [w] (Just (StructElem _ _ _)) = aNodeInitialValue w
   compile (StructElem structId label _) = SimpleCompilation $
                                             addToChangeContext structId
                                                                (StructPath label)
@@ -161,7 +172,8 @@ data DictKey k = DictKey Int  -- the id of the (shuffled) map whose value we
                               -- we are looking up
 
 instance (Datable k, Watchable v) => Watchable (DictW k (Node v)) where
-  initialValue id inners map = MapData inner
+  initialValue id inners Nothing = error "no initialValue for dict funnel"
+  initialValue id inners (Just map) = DictData inner
                                        (dictMembersDefaultValue map)
                                        Map.empty
     where
@@ -188,7 +200,7 @@ type DictLookup k v = Node (DictLookupW k)
 data DictLookupW k = DictLookup (DictKey k) Int Data
 
 instance Watchable (DictLookupW v) where
-  initialValue _ _ (DictLookup (DictKey _) _ def) = def
+  initialValue _ _ (Just (DictLookup (DictKey _) _ def)) = def
   compile (DictLookup (DictKey contextId) dictId _) = SimpleCompilation go
     where go change@(Change cxt _) = trace ("picked up a " ++ show p ++ " from " ++ show contextId ++ " for " ++ show dictId) $ 
                                      addToChangeContext contextId p change
@@ -199,7 +211,7 @@ type MSet a = Node (MSetW a)
 data MSetW a = DictValuesMSet Int Data
 
 instance Watchable (MSetW a) where
-  initialValue _ _ (DictValuesMSet id d) = MapData id d Map.empty
+  initialValue _ _ (Just (DictValuesMSet id d)) = DictData id d Map.empty
   compile (DictValuesMSet _ _) = SimpleCompilation return
 
 
@@ -210,10 +222,10 @@ data IntegerW = SumInteger
               | ReplaceToProduct
 
 instance Watchable IntegerW where
-  initialValue id _ (SumInteger) = IntegerData 0
-  initialValue id _ (SumToReplace) = IntegerData 0
-  initialValue id _ (ReplaceToProduct) = IntegerData 1
-  initialValue id _ (ProductInteger) = IntegerData 1
+  initialValue id _ (Just SumInteger) = IntegerData 0
+  initialValue id _ (Just SumToReplace) = IntegerData 0
+  initialValue id _ (Just ReplaceToProduct) = IntegerData 1
+  initialValue id _ (Just ProductInteger) = IntegerData 1
   compile (SumInteger) 
     = SimpleCompilation $ \(Change cxt impulse) -> 
                             [Change cxt (sumf impulse)]
@@ -309,7 +321,7 @@ getLandingChanges' compiled@(landingSite, propss, mods, paths) change stateValue
         landing = if node == landingSite then changes else []
 
 lookupByPath [] _ v = v
-lookupByPath ((LookupMap k):p) ctx (MapData id d m)
+lookupByPath ((LookupMap k):p) ctx (DictData id d m)
   = lookupByPath p ctx v
   where ctxElement = fromJustNote ("No " ++ show k ++ 
                                     " in context when doing path lookup") $
@@ -336,10 +348,10 @@ applyChanges stateWatchable changes stateValue
                        applyLandingChange c s)
           stateValue changes
 
-applyLandingChange (Change context impulse) (MapData id def map)
-  = MapData id def $ Map.alter go
-                               p
-                               map
+applyLandingChange (Change context impulse) (DictData id def map)
+  = DictData id def $ Map.alter go
+                                p
+                                map
   where pElem = fromJustNote ("can't find context for map " ++ show id) $
                              Map.lookup id context
         (MapPath p) = pElem
@@ -355,7 +367,7 @@ applyLandingChange (Change context impulse) value = applyImpulse impulse value
 
 applyImpulse (ReplaceImpulse d) _ = d
 applyImpulse (ListImpulse impulse) (ListData value) = ListData $ go impulse value
-  where go (AddElement elem) elems = elem:elems
+  where go (AddElement elem) elems = elems ++ [elem]
         go (RemoveElement elem) elems = List.delete elem elems
 applyImpulse (IntImpulse impulse) (IntegerData value) = IntegerData $ go impulse value
   where go (AddInteger m) n = m + n

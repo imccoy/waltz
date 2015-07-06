@@ -41,6 +41,7 @@ test-suite test
   type: exitcode-stdio-1.0
   hs-source-dirs: tests
   main-is: test.hs
+  Extensions: ScopedTypeVariables
   build-depends:
       base >= 4 && < 5
     , containers
@@ -48,5 +49,7 @@ test-suite test
     , tasty
     , tasty-hunit
     , tasty-smallcheck
+    , tasty-quickcheck
+    , text
     , waltz
 
