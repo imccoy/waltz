@@ -6,7 +6,6 @@ import qualified Data.Text as T
 
 import Test.Tasty
 import Test.Tasty.HUnit
-import qualified Test.Tasty.SmallCheck as SC
 import qualified Test.Tasty.QuickCheck as QC
 
 import qualified Waltz as W
@@ -41,11 +40,16 @@ tests = testGroup "Tests" [listTests, shuffleTests]
 listTests = testGroup "Lists"
   [ testCase "the input can pass through unchanged " $
     [1 :: Integer, 2] `compare` runList (\inp -> return inp) [1 :: Integer, 2] @?= EQ
-  , SC.testProperty "map int->int" $
+  , QC.testProperty "map int->int" $
     \(as :: [Integer]) -> 
       let f = (* 3)
        in map f as == runList (\inp -> W.mapList f inp) as
-  , SC.testProperty "map int->string" $
+  , QC.testProperty "map int->int->int" $
+    \(as :: [Integer]) -> 
+      let f = (* 3)
+          g = (+ 2)
+       in map f (map g as) == runList (\inp -> W.mapList f =<< W.mapList g inp) as
+  , QC.testProperty "map int->string" $
     \(as :: [Integer]) -> 
       let f = (T.pack . show)
        in map f as == runList (\inp -> W.mapList f inp) as
@@ -59,4 +63,9 @@ shuffleTests = testGroup "Shuffling" $
         \(as :: [Integer]) ->
           let f n = n `mod` 4
            in (hsShuffle f as) == runListToDict (\inp -> W.shuffle f inp) as
+      , QC.testProperty "can map over a shuffled list" $
+        \(as :: [Integer]) ->
+          let f n = n `mod` 4
+           in (==) (Map.map (map (*2)) (hsShuffle f as))
+                   (runListToDict (\inp -> W.mapDict (W.mapList (*2)) =<< W.shuffle f inp) as)
       ]
