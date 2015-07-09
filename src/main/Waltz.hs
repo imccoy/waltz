@@ -63,7 +63,7 @@ instance Datable a => Datable [a] where
 mapmap2 :: (Ord k1, Ord k2) => (k1 -> k2) -> (v1 -> v2) -> Map k1 v1 -> Map k2 v2
 mapmap2 fk fv = Map.mapKeys fk . Map.map fv
 
-instance (Monoid a, Datable k, Ord k, Datable a) => Datable (Map k a) where
+instance (Datable k, Ord k, Datable a) => Datable (Map k a) where
   toData = error "no toData for Map/Dict"
   fromData (DictData _ _ dict) = mapmap2 fromData fromData dict
 
@@ -74,8 +74,6 @@ instance Datable Prelude.Integer where
 instance Datable Text where
   toData s = StringData s
   fromData (StringData s) = s
-
-
 
 data AnyNode = forall a. (Watchable a, PPrint a) => AnyNode !(Node a)
 

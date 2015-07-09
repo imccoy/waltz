@@ -10,9 +10,10 @@ library
   Hs-Source-Dirs: src/main
   Extensions: ExistentialQuantification,
               FlexibleInstances,
+              FunctionalDependencies,
+              GADTs,
               MultiParamTypeClasses,
               OverloadedStrings,
-              GADTs,
               ScopedTypeVariables,
               TupleSections,
               ViewPatterns
